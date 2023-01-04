@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/HowardDunn/go-dominos/dominos"
+	"github.com/HowardDunn/jsd-ai/duppy"
 	"github.com/HowardDunn/jsd-ai/nn"
 	jsdonline "github.com/HowardDunn/jsd-online-game/game"
 	"github.com/schollz/progressbar/v3"
@@ -23,8 +24,8 @@ type gameCache struct {
 	TimeCreate time.Time            `bson:"timeCreated", json:"timeCreated"`
 }
 
-func LoadData() []*gameCache {
-	dat, err := os.ReadFile("./data/december_25_games_partner.json")
+func LoadData(path string) []*gameCache {
+	dat, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatal("Unable to read file")
 		return nil
@@ -46,16 +47,17 @@ func calculateAverageSquaredCost(x []float64) float64 {
 	return s / float64(len(x))
 }
 
-func userIn(users []string, user string) bool {
+func userIn(users []string, filteredUsers map[string]any) bool {
 	for _, usr := range users {
-		if usr == user {
+		_, ok := filteredUsers[usr]
+		if ok {
 			return true
 		}
 	}
 	return false
 }
 
-func main() {
+func trainHuman() {
 	path := "./results/" + time.Now().Format(time.RFC3339)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		err := os.Mkdir(path, 0o644)
@@ -66,16 +68,17 @@ func main() {
 
 	// variables
 	learnRate := 0.001
-	filteredUser := "ozark.games"
-	filterUsers := false
-	hiddenLayerNodes := 1000
-	epochs := 3
+	filteredUsers := map[string]any{"deigodon201": nil}
+	filterUsers := true
+	hiddenLayerNodes := 150
+	epochs := 10
 
-	jsdai := nn.New(126, hiddenLayerNodes, 56)
+	jsdai := nn.New(126, []int{hiddenLayerNodes}, 56)
 	r := make([]float64, 96)
 	nn.FillRandom(r, float64(len(r)))
 
-	gameCaches := LoadData()
+	gameCaches := LoadData("./data/deigodon201.json")
+	// gameCaches := LoadData("./data/ozark.games.json")
 	log.Info("Successfully Loaded data")
 
 	randomSeed := time.Now().UnixNano()
@@ -86,6 +89,7 @@ func main() {
 	trainingGamesIndex := int(float64(len(gameCaches)) * 0.8)
 	trainingGames := gameCaches[:trainingGamesIndex]
 	validationGames := gameCaches[trainingGamesIndex:]
+	correctGameEventTime := time.Date(2022, 12, 9, 0, 0, 0, 0, time.Local)
 
 	// predictionEvaluation
 	evaluate := func() float64 {
@@ -95,14 +99,19 @@ func main() {
 		incompatibles := 0.0
 		bar := progressbar.Default(int64(len(validationGames)))
 		for _, gameCache := range validationGames {
-			if !userIn(gameCache.GameEvents[0].PlayerNames[:], filteredUser) && filterUsers {
+			bar.Add(1)
+			if !userIn(gameCache.GameEvents[0].PlayerNames[:], filteredUsers) && filterUsers {
 				continue
 			}
-			bar.Add(1)
+
+			if gameCache.TimeCreate.Before(correctGameEventTime) {
+				continue
+			}
 			for _, gameEvent := range gameCache.GameEvents {
 				if gameEvent.EventType == dominos.PlayedCard {
 					rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
-					if filteredUser != rotatedGameEvent.PlayerNames[0] && filterUsers {
+					_, ok := filteredUsers[rotatedGameEvent.PlayerNames[0]]
+					if !ok && filterUsers {
 						continue
 					}
 					cardChoice, err := jsdai.Predict(rotatedGameEvent)
@@ -139,19 +148,23 @@ func main() {
 	}
 
 	averageCosts := []float64{}
-
 	train := func() {
 		bar := progressbar.Default(int64(len(trainingGames)))
 		for _, gameCache := range trainingGames {
-			if !userIn(gameCache.GameEvents[0].PlayerNames[:], filteredUser) && filterUsers {
+			bar.Add(1)
+			if gameCache.TimeCreate.Before(correctGameEventTime) {
 				continue
 			}
-			bar.Add(1)
+
+			if !userIn(gameCache.GameEvents[0].PlayerNames[:], filteredUsers) && filterUsers {
+				continue
+			}
 			gameCost := []float64{}
 			for _, gameEvent := range gameCache.GameEvents {
 				if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {
 					rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
-					if filteredUser != rotatedGameEvent.PlayerNames[0] && filterUsers {
+					_, ok := filteredUsers[rotatedGameEvent.PlayerNames[0]]
+					if !ok && filterUsers {
 						continue
 					}
 					cost, err := jsdai.Train(rotatedGameEvent, learnRate)
@@ -159,6 +172,10 @@ func main() {
 						log.Fatal("Error training: ", err)
 					}
 					gameCost = append(gameCost, cost)
+				} else if gameEvent.EventType == dominos.Passed {
+					jsdai.UpdatePassMemory(gameEvent)
+				} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
+					jsdai.ResetPassMemory()
 				}
 			}
 			averageCosts = append(averageCosts, calculateAverageSquaredCost(gameCost))
@@ -214,4 +231,194 @@ func main() {
 	}
 
 	jsdai.Save(path + "model.mdl")
+}
+
+func trainReinforced() {
+	// Train Reinforcement
+	start := time.Now()
+	hiddenLayerNodes1 := 150
+	hiddenLayerNodes2 := 350
+	hiddenLayerNodes3 := 750
+	hiddenLayerNodes4 := 1500
+	learnRate := 0.001
+	sameGameIterations := 10
+	totalRoundWins := [4]int{}
+	jsdai1 := nn.New(126, []int{hiddenLayerNodes1}, 56)
+	jsdai2 := nn.New(126, []int{hiddenLayerNodes2}, 56)
+	jsdai3 := nn.New(126, []int{hiddenLayerNodes3}, 56)
+	jsdai4 := nn.New(126, []int{hiddenLayerNodes4}, 56)
+	jc := nn.New(126, []int{1000}, 56)
+	jc.Load("./results/" + "johncanoe.mdl")
+	jsdai1.Load("./results/" + "jasai1.mdl")
+	jsdai2.Load("./results/" + "jasai2.mdl")
+	jsdai3.Load("./results/" + "jasai3.mdl")
+	jsdai4.Load("./results/" + "jasai4.mdl")
+
+	reinForceMentLearn := func(r int64) {
+		iter := func(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, totWins [4]*int) {
+			dominosGame := dominos.NewLocalGame(dp, int64(r), "cutthroat")
+			roundGameEvents := []*dominos.GameEvent{}
+			lastGameEvent := &dominos.GameEvent{}
+			gameCost := []float64{}
+			for lastGameEvent != nil && lastGameEvent.EventType != dominos.GameWin {
+				lastGameEvent = dominosGame.AdvanceGameIteration()
+				// log.Infof("LastGame Event: %+#v", lastGameEvent)
+				roundGameEvents = append(roundGameEvents, lastGameEvent)
+				if lastGameEvent.EventType == dominos.RoundWin {
+					for _, gameEvent := range roundGameEvents {
+						if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {
+							jsdai := nnPlayers[gameEvent.Player]
+							rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
+							cost, err := jsdai.TrainReinforced(rotatedGameEvent, learnRate, lastGameEvent)
+							if err != nil {
+								log.Fatal("Error training: ", err)
+							}
+							gameCost = append(gameCost, cost)
+						} else if gameEvent.EventType == dominos.Passed {
+							jsdai := nnPlayers[gameEvent.Player]
+							jsdai.UpdatePassMemory(gameEvent)
+						} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
+							jsdai := nnPlayers[gameEvent.Player]
+							jsdai.ResetPassMemory()
+						}
+					}
+					roundGameEvents = []*dominos.GameEvent{}
+				} else if lastGameEvent.EventType == dominos.RoundDraw {
+					roundGameEvents = []*dominos.GameEvent{}
+					jsdai1.ResetPassMemory()
+					jsdai2.ResetPassMemory()
+					jsdai3.ResetPassMemory()
+					jsdai4.ResetPassMemory()
+				}
+
+			}
+			*totWins[0] += lastGameEvent.PlayerWins[0]
+			*totWins[1] += lastGameEvent.PlayerWins[1]
+			*totWins[2] += lastGameEvent.PlayerWins[2]
+			*totWins[3] += lastGameEvent.PlayerWins[3]
+
+			jsdai1.Save("./results/" + "jasai1.mdl")
+			jsdai2.Save("./results/" + "jasai2.mdl")
+			jsdai3.Save("./results/" + "jasai3.mdl")
+			jsdai4.Save("./results/" + "jasai4.mdl")
+		}
+
+		for i := 0; i < sameGameIterations; i++ {
+			// TODO: bar
+			nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
+			gp := [4]dominos.Player{nnPlayers[0], nnPlayers[1], nnPlayers[2], nnPlayers[3]}
+			tots := [4]*int{&nnPlayers[0].TotalWins, &nnPlayers[1].TotalWins, &nnPlayers[2].TotalWins, &nnPlayers[3].TotalWins}
+			iter(gp, nnPlayers, tots)
+
+		}
+
+		// for i := 0; i < sameGameIterations; i++ {
+		// 	// TODO: bar
+		// 	nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
+		// 	rand.Shuffle(len(nnPlayers), func(i, j int) { nnPlayers[i], nnPlayers[j] = nnPlayers[j], nnPlayers[i] })
+		// 	gp := [4]dominos.Player{nnPlayers[0], nnPlayers[1], nnPlayers[2], nnPlayers[3]}
+		// 	tots := [4]*int{&nnPlayers[0].TotalWins, &nnPlayers[1].TotalWins, &nnPlayers[2].TotalWins, &nnPlayers[3].TotalWins}
+		// 	iter(gp, nnPlayers, tots)
+
+		// }
+
+		// for i := 0; i < sameGameIterations; i++ {
+		// 	// TODO: bar
+		// 	nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
+		// 	gp := [4]dominos.Player{nnPlayers[0], &dominos.ComputerPlayer{}, nnPlayers[3], jc}
+		// 	tots := [4]*int{&totalRoundWins[0], &totalRoundWins[1], &totalRoundWins[2], &totalRoundWins[3]}
+		// 	iter(gp, nnPlayers, tots)
+		// }
+	}
+
+	randomSeed := time.Now().UnixNano()
+	log.Info("Using random Seed: ", randomSeed)
+	rand.Seed(randomSeed)
+	for j := 0; j < 100000; j++ {
+		randNum := rand.Int63n(9223372036854775607)
+		reinForceMentLearn(randNum)
+		log.Info("Games Seen: ", j+1)
+		log.Debug("Player Wins: ", totalRoundWins, " Total Rounds: ", totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		// r1 := float64(totalRoundWins[0]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		// r2 := float64(totalRoundWins[1]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		// r3 := float64(totalRoundWins[2]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		// r4 := float64(totalRoundWins[3]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		// log.Info("Player Ratios: ", []float64{r1, r2, r3, r4})
+		log.Info("NN Wins: ", []int{jsdai1.TotalWins, jsdai2.TotalWins, jsdai3.TotalWins, jsdai4.TotalWins})
+		n1 := float64(jsdai1.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
+		n2 := float64(jsdai2.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
+		n3 := float64(jsdai3.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
+		n4 := float64(jsdai4.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
+		log.Info("NN Ratios: ", []float64{n1, n2, n3, n4})
+	}
+
+	jsdai1.Save("./results/" + "jasai1.mdl")
+	jsdai2.Save("./results/" + "jasai2.mdl")
+	jsdai3.Save("./results/" + "jasai3.mdl")
+	jsdai4.Save("./results/" + "jasai4.mdl")
+	log.Info("Took : ", time.Now().Sub(start))
+}
+
+func duppyPlay() {
+	token, err := duppy.UserLogin("duppy", "@ecIN)A*$Y93UhZ*")
+	if err != nil {
+		panic(err)
+	}
+	joinedGame := false
+	gamesPlayed := 0
+	for {
+		onlineTables, err := duppy.GetOnlineTableList(token)
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+
+		for _, table := range onlineTables {
+			if table.PlayerInvolved && table.GameState == "running" {
+				log.Info("Playing game: ", table.GameID)
+				duppy.PlayGame(table, token)
+				gamesPlayed++
+				log.Info("Finished playing game: ", table.GameID, " Num Played: ", gamesPlayed)
+				joinedGame = false
+				onlineTables = []*duppy.OnlineGameTable{}
+				break
+			}
+		}
+
+		for _, table := range onlineTables {
+			if !joinedGame {
+				if table.GameType == "cutthroat" && table.GameState == "waiting" {
+					log.Infof("%+#v", table)
+					position := 0
+					users := []string{table.Player1.Username, table.Player2.Username, table.Player3.Username, table.Player4.Username}
+					for i, user := range users {
+						if user == "" {
+							position = i
+							break
+						}
+					}
+					gamePayload := &duppy.OnlineGamePayload{
+						GameID:   table.GameID,
+						Position: position,
+					}
+
+					err := duppy.JoinOnlineGame(gamePayload, token)
+					if err != nil {
+						log.Error(err)
+						continue
+					}
+					joinedGame = true
+					break
+				}
+			}
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func main() {
+	trainReinforced()
+	// trainHuman()
+	// duppyPlay()
 }
