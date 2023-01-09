@@ -143,7 +143,9 @@ func GetOnlineTableList(token string) ([]*OnlineGameTable, error) {
 }
 
 func PlayGame(game *OnlineGameTable, token string) {
-	jsdAI := nn.New(126, []int{150}, 56)
+	jsdAI := nn.New(126, []int{20, 25}, 56)
+	jsdAI.Search = true
+	jsdAI.SearchNum = 10000
 	err := jsdAI.Load("./results/duppy.mdl")
 	if err != nil {
 		log.Error("Error: ", err)
@@ -158,11 +160,12 @@ func PlayGame(game *OnlineGameTable, token string) {
 	for lastGameEvent.GameState != dominos.Idle {
 		lastGameEvent = g.AdvanceGameIteration()
 		if lastGameEvent.EventType != dominos.NullEvent {
-			roundGameEvents = append(roundGameEvents, lastGameEvent)
+			lGE := jsdonline.CopyandRotateGameEvent(lastGameEvent, 0)
+			roundGameEvents = append(roundGameEvents, lGE)
 		}
 		if lastGameEvent.EventType == dominos.PlayerTurn && lastGameEvent.Player == 0 {
-			log.Info("AI Player Turn")
 			if lastGameEvent.BoardState.CardPosed {
+				log.Info("AI Player Turn")
 				card, side := jsdAI.PlayCard(lastGameEvent, dominos.GetCLIDominos())
 				cardChoice := &dominos.CardChoice{
 					Card: card,
@@ -179,7 +182,6 @@ func PlayGame(game *OnlineGameTable, token string) {
 				g.PlayHumanCard(cardChoice)
 				log.Infof("Posed Card: %+#v", cardChoice)
 			}
-
 		} else if lastGameEvent.EventType == dominos.Passed {
 			jsdAI.UpdatePassMemory(lastGameEvent)
 		} else if lastGameEvent.EventType == dominos.RoundWin || lastGameEvent.EventType == dominos.RoundDraw {
@@ -205,6 +207,8 @@ func PlayGame(game *OnlineGameTable, token string) {
 			jsdAI.Save("duppy2.mdl")
 			return
 		}
+
+		time.Sleep(300 * time.Millisecond)
 
 	}
 }

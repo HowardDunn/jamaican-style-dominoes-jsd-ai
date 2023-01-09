@@ -4,7 +4,9 @@ import (
 	"encoding/gob"
 	"errors"
 	"math"
+	"math/rand"
 	"os"
+	"time"
 
 	"github.com/HowardDunn/go-dominos/dominos"
 	jsdonline "github.com/HowardDunn/jsd-online-game/game"
@@ -24,9 +26,16 @@ type JSDNN struct {
 	bHidden []*tensor.Dense
 	bFinal  *tensor.Dense
 	*dominos.ComputerPlayer
-	passMemory [28]float64
-	TotalWins  int
-	TotalWins2 int
+	passMemory    [28]float64
+	TotalWins     int
+	TotalWins2    int
+	inputDim      int
+	hiddenDim     []int
+	outputDim     int
+	gameType      string
+	knownNotHaves [4]map[uint]bool
+	Search        bool
+	SearchNum     int
 }
 
 func fillRandom(a []float64, v float64) {
@@ -58,32 +67,41 @@ func New(input int, hidden []int, output int) *JSDNN {
 	r4 := make([]float64, output)
 	hiddenT := []*tensor.Dense{}
 	bHidden := []*tensor.Dense{}
+	rb := make([]float64, hidden[0])
+	r3 = append(r3, rb)
+	fillRandom(r, float64(len(r)))
+	fillRandom(r3[0], float64(len(r3[0])))
+	hiddenT = append(hiddenT, tensor.New(tensor.WithShape(hidden[0], input), tensor.WithBacking(r)))
+	bHidden = append(bHidden, tensor.New(tensor.WithShape(hidden[0]), tensor.WithBacking(r3[0])))
 
 	for i := range hidden {
-		previous := input
-		backing := r
 		next := output
 		if (i + 1) < len(hidden) {
 			next = hidden[i+1]
 		}
-		if i > 0 {
-			previous = hidden[i-1]
-			backing = r2[i-1]
-		}
 		h := make([]float64, hidden[i]*next)
-		hb := make([]float64, hidden[i])
+
 		fillRandom(h, float64(len(h)))
-		fillRandom(hb, float64(len(hb)))
+
 		r2 = append(r2, h)
-		r3 = append(r3, hb)
-		hiddenT = append(hiddenT, tensor.New(tensor.WithShape(hidden[i], previous), tensor.WithBacking(backing)))
-		bHidden = append(bHidden, tensor.New(tensor.WithShape(hidden[i]), tensor.WithBacking(r3[i])))
+
+		if (i + 1) < len(hidden) {
+			hb := make([]float64, hidden[i+1])
+			fillRandom(hb, float64(len(hb)))
+			r3 = append(r3, hb)
+			hiddenT = append(hiddenT, tensor.New(tensor.WithShape(next, hidden[i]), tensor.WithBacking(r2[i])))
+			bHidden = append(bHidden, tensor.New(tensor.WithShape(hidden[i+1]), tensor.WithBacking(r3[i+1])))
+		}
 	}
 
 	fillRandom(r, float64(len(r)))
 
 	finalT := tensor.New(tensor.WithShape(output, hidden[len(hidden)-1]), tensor.WithBacking(r2[len(r2)-1]))
 	bFinal := tensor.New(tensor.WithShape(output), tensor.WithBacking(r4))
+	knownNotHaves := [4]map[uint]bool{}
+	for i := 0; i < len(knownNotHaves); i++ {
+		knownNotHaves[i] = make(map[uint]bool)
+	}
 
 	return &JSDNN{
 		hidden:         hiddenT,
@@ -91,6 +109,11 @@ func New(input int, hidden []int, output int) *JSDNN {
 		bHidden:        bHidden,
 		bFinal:         bFinal,
 		ComputerPlayer: &dominos.ComputerPlayer{},
+		inputDim:       input,
+		hiddenDim:      hidden,
+		outputDim:      output,
+		gameType:       "cutthroat",
+		knownNotHaves:  knownNotHaves,
 	}
 }
 
@@ -140,16 +163,35 @@ func (j *JSDNN) UpdatePassMemory(gameEvent *dominos.GameEvent) {
 	gameEvent = jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
 	card := gameEvent.Card
 	player := gameEvent.Player
-	dom := dominos.GetCLIDominos()[card]
+	doms := dominos.GetCLIDominos()
+	dom := doms[card]
 	suit1, suit2 := dom.GetSuits()
 	suit1Index := uint(player*7) + suit1
 	suit2Index := uint(player*7) + suit2
 	j.passMemory[suit1Index] = 1.0
 	j.passMemory[suit2Index] = 1.0
+	for i := 0; i < 28; i++ {
+		suit11, suit22 := doms[i].GetSuits()
+
+		if suit11 == suit1 || suit11 == suit2 {
+			j.knownNotHaves[player][uint(i)] = true
+		} else if suit22 == suit1 || suit22 == suit2 {
+			j.knownNotHaves[player][uint(i)] = true
+		}
+	}
 }
 
 func (j *JSDNN) ResetPassMemory() {
 	j.passMemory = [28]float64{}
+	j.knownNotHaves = [4]map[uint]bool{}
+	for i := 0; i < len(j.knownNotHaves); i++ {
+		j.knownNotHaves[i] = make(map[uint]bool)
+	}
+	for i := 0; i < len(j.knownNotHaves); i++ {
+		for k := 0; k < 28; k++ {
+			j.knownNotHaves[i][uint(i)] = false
+		}
+	}
 }
 
 func (j *JSDNN) ConvertGameEventToTensor(gameEvent *dominos.GameEvent) (tensor.Tensor, int, int) {
@@ -254,7 +296,10 @@ func (j *JSDNN) ConvertCardChoiceToTensor(gameEvent *dominos.GameEvent) tensor.T
 	return res
 }
 
-func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent, lastGameEvent *dominos.GameEvent) tensor.Tensor {
+func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent, newGameEvents [4]*dominos.GameEvent) tensor.Tensor {
+	// Since the agent will want to maximize the reward, lets reward for every time it is able to play the next turn
+	// I think it makes sense to look at the 4 events, the relevant events, pass, play card, round win
+
 	cardChoice := [56]float64{}
 	index := gameEvent.Card
 	if gameEvent.Side == dominos.Right {
@@ -264,20 +309,22 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 	isDouble := dominos.GetCLIDominos()[gameEvent.Card].IsDouble()
 	if rew == 1 {
 		rew = rew * 12.5
-		reward := rew + float64((3*lastGameEvent.PlayerCardsRemaining[1])+lastGameEvent.PlayerCardsRemaining[2]+lastGameEvent.PlayerCardsRemaining[3])/21.0
+		reward := rew + float64((lastGameEvent.PlayerCardsRemaining[1])+lastGameEvent.PlayerCardsRemaining[2]+lastGameEvent.PlayerCardsRemaining[3])/21.0
 		if isDouble {
 			reward = reward * 5.0
 		}
 		countRatio := float64(dominos.GetCLIDominos()[gameEvent.Card].GetCount()) / 12.0
 		cardChoice[index] = 1.0*reward + countRatio
 	} else {
-		reward := -1.0 * float64(lastGameEvent.PlayerCardsRemaining[0])
-		if !isDouble {
-			reward = 2.5
+		if isDouble {
+			reward := 1.5
+			countRatio := float64(dominos.GetCLIDominos()[gameEvent.Card].GetCount()) / 12.0
+			cardChoice[index] = 1.0*reward + 2.0*countRatio
+		} else {
+			reward := -3.0 * float64(lastGameEvent.PlayerCardsRemaining[0])
+			countRatio := float64(dominos.GetCLIDominos()[gameEvent.Card].GetCount()) / 12.0
+			cardChoice[index] = 1.0*reward + countRatio
 		}
-
-		countRatio := float64(dominos.GetCLIDominos()[gameEvent.Card].GetCount()) / 12.0
-		cardChoice[index] = 1.0*reward + countRatio
 	}
 
 	res := tensor.New(tensor.WithShape(56), tensor.WithBacking(cardChoice[:]))
@@ -324,6 +371,7 @@ func (j *JSDNN) predict(a tensor.Tensor) (tensor.Tensor, error) {
 
 	_, err = tensor.Add(hidden, j.bHidden[0], tensor.UseUnsafe())
 	if err != nil {
+		log.Fatal(err, " ", "add1")
 		return nil, err
 	}
 
@@ -341,6 +389,7 @@ func (j *JSDNN) predict(a tensor.Tensor) (tensor.Tensor, error) {
 
 		_, err = tensor.Add(hidden, j.bHidden[i], tensor.UseUnsafe())
 		if err != nil {
+			log.Fatal(err, " ", "add10")
 			return nil, err
 		}
 
@@ -365,6 +414,7 @@ func (j *JSDNN) predict(a tensor.Tensor) (tensor.Tensor, error) {
 
 	_, err = tensor.Add(final, j.bFinal, tensor.UseUnsafe())
 	if err != nil {
+		log.Fatal(err, " ", "add2")
 		return nil, err
 	}
 
@@ -374,6 +424,159 @@ func (j *JSDNN) predict(a tensor.Tensor) (tensor.Tensor, error) {
 	}
 
 	return prediction, nil
+}
+
+func (j *JSDNN) Clone() *JSDNN {
+	clone := New(j.inputDim, j.hiddenDim, j.outputDim)
+	clone.final = j.final.Clone().(*tensor.Dense)
+	clone.bFinal = j.bFinal.Clone().(*tensor.Dense)
+
+	for i := range clone.hidden {
+		clone.hidden[i] = j.hidden[i].Clone().(*tensor.Dense)
+	}
+
+	for i := range clone.bHidden {
+		clone.bHidden[i] = j.bHidden[i].Clone().(*tensor.Dense)
+	}
+
+	return clone
+}
+
+func (j *JSDNN) PredictSearch(gameEvent *dominos.GameEvent, searchNum int, learnRate float64) (*dominos.CardChoice, float32, error) {
+	if gameEvent.EventType == "" {
+		panic("event type nil")
+	}
+
+	if !gameEvent.BoardState.CardPosed {
+		return &dominos.CardChoice{}, 0.0, nil
+	}
+
+	cardStatesKnown := make([]uint, len(j.GetHand()))
+	copy(cardStatesKnown, j.GetHand())
+	if gameEvent.BoardState.CardPosed {
+		cardStatesKnown = append(cardStatesKnown, gameEvent.BoardState.PosedCard)
+	}
+	cardStatesKnown = append(cardStatesKnown, gameEvent.BoardState.LeftBoard...)
+	cardStatesKnown = append(cardStatesKnown, gameEvent.BoardState.RightBoard...)
+	cardStatesKnownMap := map[uint]bool{}
+	outstandingCards := []uint{}
+	for i := 0; i < 28; i++ {
+		cardStatesKnownMap[uint(i)] = false
+	}
+	for _, card := range cardStatesKnown {
+		cardStatesKnownMap[card] = true
+	}
+	for card, present := range cardStatesKnownMap {
+		if !present {
+			outstandingCards = append(outstandingCards, card)
+		}
+	}
+	// Assign Cards Based on known information
+
+	randomSeed := time.Now().UnixNano()
+	rand.Seed(randomSeed)
+
+	winners := []int{}
+	cardChoicesForWin := []*dominos.CardChoice{}
+	clone2 := j.Clone()
+	clone3 := j.Clone()
+	clone4 := j.Clone()
+	for i := 0; i < searchNum; i++ {
+
+		randomSeed := time.Now().UnixNano()
+		rand.Seed(randomSeed)
+
+		rn := rand.Int31n(100)
+		clone1 := &dominos.ComputerPlayer{RandomMode: true}
+
+		players := [4]dominos.Player{clone1, clone2, clone3, clone4}
+		if rn > 55 {
+			players = [4]dominos.Player{clone1, &dominos.ComputerPlayer{RandomMode: true}, &dominos.ComputerPlayer{RandomMode: true}, &dominos.ComputerPlayer{RandomMode: true}}
+		}
+		localGame := dominos.NewLocalGame(players, 0, j.gameType)
+		localGame.SetBoard(gameEvent.BoardState)
+		localGame.SetState(dominos.ExecutePlayerTurn)
+		rand.Shuffle(len(outstandingCards), func(i, j int) { outstandingCards[i], outstandingCards[j] = outstandingCards[j], outstandingCards[i] })
+		playerHands := [4][]uint{}
+		playerHands[0] = make([]uint, len(j.GetHand()))
+		copy(playerHands[0], j.GetHand())
+		o2 := make([]uint, len(outstandingCards))
+		copy(o2, outstandingCards)
+		for i := 1; i < 4; i++ {
+			playerHand := []uint{}
+			index := 0
+			for len(playerHand) < gameEvent.PlayerCardsRemaining[i] {
+				if !j.knownNotHaves[i][o2[index]] {
+					playerHand = append(playerHand, o2[index])
+					o2 = append(o2[:index], o2[index+1:]...)
+				} else {
+					index++
+				}
+			}
+			playerHands[i] = playerHand
+		}
+		localGame.SetPlayerHands(playerHands)
+
+		var firstCardChoice *dominos.CardChoice
+		for {
+			lastGameEvent := localGame.AdvanceGameIteration()
+			if lastGameEvent.EventType == dominos.RoundInvalid {
+				log.Info("Invalid Game")
+				log.Infof("HERE: %+#v Board: %+#v", lastGameEvent, lastGameEvent.BoardState)
+				break
+			} else if lastGameEvent.EventType == dominos.PlayedCard && lastGameEvent.Player == 0 {
+				if firstCardChoice == nil {
+					firstCardChoice = &dominos.CardChoice{Card: lastGameEvent.Card, Side: lastGameEvent.Side}
+				}
+			} else if lastGameEvent.EventType == dominos.Passed {
+				clone2.UpdatePassMemory(lastGameEvent)
+				clone3.UpdatePassMemory(lastGameEvent)
+				clone4.UpdatePassMemory(lastGameEvent)
+
+			} else if lastGameEvent.EventType == dominos.RoundWin || lastGameEvent.EventType == dominos.RoundDraw {
+
+				if firstCardChoice != nil && lastGameEvent.Player == 0 {
+					cardChoicesForWin = append(cardChoicesForWin, firstCardChoice)
+				}
+				winners = append(winners, lastGameEvent.Player)
+				clone2.ResetPassMemory()
+				clone3.ResetPassMemory()
+				clone4.ResetPassMemory()
+				break
+			}
+		}
+
+	}
+
+	count := 0
+	for i := 0; i < len(winners); i++ {
+		if winners[i] == 0 {
+			count++
+		}
+	}
+
+	popularChoice := map[uint]int{}
+	for i := 0; i < 56; i++ {
+		popularChoice[uint(i)] = 0
+	}
+
+	maxCount := 0
+	bestCard := &dominos.CardChoice{}
+
+	for i := 0; i < len(cardChoicesForWin); i++ {
+		card := cardChoicesForWin[i].Card
+		if cardChoicesForWin[i].Side == dominos.Right {
+			card += 28
+		}
+		popularChoice[card]++
+		if popularChoice[card] > maxCount {
+			maxCount = popularChoice[card]
+			bestCard = &dominos.CardChoice{Card: cardChoicesForWin[i].Card, Side: cardChoicesForWin[i].Side}
+		}
+	}
+	probab := float32(maxCount) / float32(len(winners))
+
+	return bestCard, probab, nil
 }
 
 func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, error) {
@@ -396,7 +599,7 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 
 	choice := &dominos.CardChoice{}
 	cardConfidences, ok := prediction.Data().([]float64)
-	maxConfidence := -1.0
+	maxConfidence := -100000000000.0
 	contained := func(card uint) bool {
 		hand := gameEvent.PlayerHands[gameEvent.Player]
 		if len(hand) == 0 {
@@ -448,7 +651,10 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 			}
 		}
 	}
-	// log.Infof("Card Choice: %+#v, Confidence: %.5f", choice, maxConfidence)
+	if maxConfidence < 0 {
+		log.Infof("Card Choice: %+#v, Confidence: %.5f", choice, maxConfidence)
+	}
+
 	return choice, nil
 }
 
@@ -474,6 +680,7 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 
 	_, err = tensor.Add(hidden, j.bHidden[0], tensor.UseUnsafe())
 	if err != nil {
+		log.Fatal(err, " ", "add3")
 		return 0.0, err
 	}
 
@@ -489,6 +696,8 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 		return 0.0, err
 	}
 
+	hiddenActs = append(hiddenActs, hiddenActivation.Clone().(tensor.Tensor))
+
 	for i := 1; i < len(j.hidden); i++ {
 		hidden, err = j.hidden[i].MatVecMul(hiddenActivation)
 		if err != nil {
@@ -498,6 +707,7 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 
 		_, err = tensor.Add(hidden, j.bHidden[i], tensor.UseUnsafe())
 		if err != nil {
+			log.Fatal(err, " ", "add4")
 			return 0.0, err
 		}
 
@@ -523,6 +733,7 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 
 	_, err = tensor.Add(final, j.bFinal, tensor.UseUnsafe())
 	if err != nil {
+		log.Fatal(err, " ", "add5")
 		return 0.0, err
 	}
 
@@ -609,14 +820,15 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 
 	// The Bias is just the same term without the hidden activation
 	dcost_dbiashidden := hiddErrs.Clone().(tensor.Tensor)
+	hErrs := hiddErrs.Clone().(tensor.Tensor)
 
-	hiddenActs[len(hiddenActs)-1].T()
-	dcost_dhidden, err := tensor.MatMul(hiddErrs, hiddenActs[len(hiddenActs)-1])
+	hiddenActs[len(hiddenActs)-2].T()
+	dcost_dhidden, err := tensor.MatMul(hiddErrs, hiddenActs[len(hiddenActs)-2])
 	if err != nil {
 		log.Fatal(err, " ", "13")
 		return 0.0, err
 	}
-	hiddenActs[len(hiddenActs)-1].UT()
+	hiddenActs[len(hiddenActs)-2].UT()
 
 	// Update the gradients
 	_, err = tensor.Mul(dcost_dfinal, learnRate, tensor.UseUnsafe())
@@ -633,12 +845,14 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 
 	_, err = tensor.Add(j.final, dcost_dfinal, tensor.UseUnsafe())
 	if err != nil {
+		log.Fatal(err, " ", "add6")
 		log.Fatal(err, " ", "16")
 		return 0.0, err
 	}
 
 	_, err = tensor.Add(j.bFinal, dcost_dbiasfinal, tensor.UseUnsafe())
 	if err != nil {
+		log.Fatal(err, " ", "add19")
 		log.Fatal(err, " ", "17")
 		return 0.0, err
 	}
@@ -657,14 +871,92 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 
 	_, err = tensor.Add(j.hidden[len(j.hidden)-1], dcost_dhidden, tensor.UseUnsafe())
 	if err != nil {
-		log.Fatal(err, " ", "17")
+		log.Fatal(err, " ", "add111")
 		return 0.0, err
 	}
 
 	_, err = tensor.Add(j.bHidden[len(j.bHidden)-1], dcost_dbiashidden, tensor.UseUnsafe())
 	if err != nil {
-		log.Fatal(err, " ", "17")
+		log.Fatal(err, " ", "add7")
 		return 0.0, err
+	}
+
+	// Calculate the update for the rest of the hidden layers
+
+	j.hidden[len(j.hidden)-1].T()
+	hErrs, err = tensor.MatMul(j.hidden[len(j.hidden)-1], hErrs)
+	if err != nil {
+		log.Fatal(err, " ", "7")
+		return 0.0, err
+	}
+	j.hidden[len(j.hidden)-1].UT()
+
+	for i := (len(j.hidden) - 1); i > 0; i-- {
+
+		dHiddenActivation, err := hiddenActs[i].Apply(reluPrime)
+		if err != nil {
+			log.Fatal(err, " ", "10")
+			return 0.0, err
+		}
+
+		_, err = tensor.Mul(hErrs, dHiddenActivation)
+		if err != nil {
+			log.Fatal(err, " ", "11", " ", len(j.hidden))
+			return 0.0, err
+		}
+
+		err = hErrs.Reshape(hErrs.Shape()[0], 1)
+		if err != nil {
+			log.Fatal(err, " ", "12")
+			return 0.0, err
+		}
+
+		// The Bias is just the same term without the hidden activation
+		dcost_dbiashidden = hErrs.Clone().(tensor.Tensor)
+		hErrsCache := hErrs.Clone().(tensor.Tensor)
+
+		hiddenActs[i-1].T()
+		dcost_dhidden, err = tensor.MatMul(hErrs, hiddenActs[i-1])
+		if err != nil {
+			log.Fatal(err, " ", "13")
+			return 0.0, err
+		}
+		hiddenActs[i-1].UT()
+
+		_, err = tensor.Mul(dcost_dbiashidden, learnRate, tensor.UseUnsafe())
+		if err != nil {
+			log.Fatal(err, " ", "15")
+			return 0.0, err
+		}
+
+		_, err = tensor.Mul(dcost_dhidden, learnRate, tensor.UseUnsafe())
+		if err != nil {
+			log.Fatal(err, " ", "15")
+			return 0.0, err
+		}
+
+		_, err = tensor.Add(j.hidden[i-1], dcost_dhidden, tensor.UseUnsafe())
+		if err != nil {
+			log.Fatal(err, " ", "add8")
+			log.Fatal(err, " ", "17")
+			return 0.0, err
+		}
+
+		_, err = tensor.Add(j.bHidden[i-1], dcost_dbiashidden, tensor.UseUnsafe())
+		if err != nil {
+			log.Fatal(err, " ", "add9")
+			log.Fatal(err, " ", "17")
+			return 0.0, err
+		}
+
+		j.hidden[i-1].T()
+		hErrs, err = tensor.MatMul(j.hidden[i-1], hErrsCache)
+		if err != nil {
+			log.Fatal(err, " ", "7")
+			return 0.0, err
+		}
+		j.hidden[i-1].UT()
+
 	}
 
 	return cost, nil
@@ -684,7 +976,7 @@ func (j *JSDNN) Train(gameEvent *dominos.GameEvent, learnRate float64) (float64,
 	return j.train(x, y, gameEvent, learnRate)
 }
 
-func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64, finalGameEvent *dominos.GameEvent) (float64, error) {
+func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64, nextGameEvents [4]*dominos.GameEvent, finalGameEvent *dominos.GameEvent) (float64, error) {
 	if gameEvent.EventType != dominos.PlayedCard && gameEvent.EventType != dominos.PosedCard {
 		return 0.0, errors.New("Invalid game event to train with")
 	}
@@ -856,10 +1148,51 @@ func (j *JSDNN) PoseCard(doms []dominos.Domino) uint {
 
 func (j *JSDNN) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (uint, dominos.BoardSide) {
 	gameEvent = jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
+
 	cardChoice, err := j.Predict(gameEvent)
 	if err != nil {
 		log.Warn("Error predicting using AI")
 		return j.ComputerPlayer.PlayCard(gameEvent, doms)
+	}
+	typ := "predict"
+	if j.Search {
+		cardChoiceSearch, probability, err := j.PredictSearch(gameEvent, j.SearchNum, 0.001)
+		if err != nil {
+			log.Warn("Error predicting Search using AI")
+			return j.ComputerPlayer.PlayCard(gameEvent, doms)
+		}
+
+		sameChoice := true
+		if cardChoiceSearch.Card != cardChoice.Card || cardChoiceSearch.Side != cardChoice.Side {
+			sameChoice = false
+		}
+
+		if sameChoice && probability < 0.285 && !doms[cardChoice.Card].IsDouble() {
+			explorer := New(j.inputDim, j.hiddenDim, j.outputDim)
+			cardChoiceExplorer, err := explorer.Predict(gameEvent)
+			if err == nil {
+				compatibleCard := false
+				suit1, suit2 := doms[cardChoice.Card].GetSuits()
+				if cardChoice.Side == dominos.Left {
+					if suit1 == gameEvent.BoardState.LeftSuit || suit2 == gameEvent.BoardState.LeftSuit {
+						compatibleCard = true
+					}
+				} else {
+					if suit1 == gameEvent.BoardState.RightSuit || suit2 == gameEvent.BoardState.RightSuit {
+						compatibleCard = true
+					}
+				}
+				if compatibleCard {
+					cardChoice = cardChoiceExplorer
+				}
+				typ = "explored"
+			}
+		} else if probability > 0.35 && !sameChoice {
+			cardChoice = cardChoiceSearch
+			log.Infof("Better choice %+#v Probab %.2f", cardChoiceSearch, probability)
+			typ = "better"
+		}
+
 	}
 
 	compatibleCard := false
@@ -875,7 +1208,7 @@ func (j *JSDNN) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (u
 	}
 
 	if !compatibleCard {
-		log.Warnf("AI picked incompatible card: %+#v", cardChoice)
+		log.Warnf("AI picked incompatible card: %+#v %s", cardChoice, typ)
 		return j.ComputerPlayer.PlayCard(gameEvent, doms)
 	}
 	// log.Infof("Precicted: %+#v", cardChoice)
