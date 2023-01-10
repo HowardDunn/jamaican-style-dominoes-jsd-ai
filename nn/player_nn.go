@@ -296,37 +296,61 @@ func (j *JSDNN) ConvertCardChoiceToTensor(gameEvent *dominos.GameEvent) tensor.T
 	return res
 }
 
-func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent, newGameEvents [4]*dominos.GameEvent) tensor.Tensor {
+func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent, nextGameEvents [12]*dominos.GameEvent) tensor.Tensor {
 	// Since the agent will want to maximize the reward, lets reward for every time it is able to play the next turn
 	// I think it makes sense to look at the 4 events, the relevant events, pass, play card, round win
 
 	cardChoice := [56]float64{}
 	index := gameEvent.Card
+	suitPlayed := gameEvent.BoardState.LeftSuit
 	if gameEvent.Side == dominos.Right {
 		index = index + 28
+		suitPlayed = gameEvent.BoardState.RightSuit
 	}
-	rew := float64(7-lastGameEvent.PlayerCardsRemaining[0]) / 7.0
+	reward := 1.0
+	chainBroken := false
+	hasHardEnd := false
+	boardSuitCount := gameEvent.BoardState.CountSuit(suitPlayed)
+	handSuitCount := j.CountSuit(suitPlayed, dominos.GetCLIDominos())
 	isDouble := dominos.GetCLIDominos()[gameEvent.Card].IsDouble()
-	if rew == 1 {
-		rew = rew * 12.5
-		reward := rew + float64((lastGameEvent.PlayerCardsRemaining[1])+lastGameEvent.PlayerCardsRemaining[2]+lastGameEvent.PlayerCardsRemaining[3])/21.0
-		if isDouble {
-			reward = reward * 5.0
+	if boardSuitCount+handSuitCount == 6 {
+		hasHardEnd = true
+	}
+	for i, nextEvent := range nextGameEvents {
+		if nextEvent == nil {
+			break
 		}
-		countRatio := float64(dominos.GetCLIDominos()[gameEvent.Card].GetCount()) / 12.0
-		cardChoice[index] = 1.0*reward + countRatio
-	} else {
-		if isDouble {
-			reward := 1.5
-			countRatio := float64(dominos.GetCLIDominos()[gameEvent.Card].GetCount()) / 12.0
-			cardChoice[index] = 1.0*reward + 2.0*countRatio
-		} else {
-			reward := -3.0 * float64(lastGameEvent.PlayerCardsRemaining[0])
-			countRatio := float64(dominos.GetCLIDominos()[gameEvent.Card].GetCount()) / 12.0
-			cardChoice[index] = 1.0*reward + countRatio
+		modded := (i + 1) % 4
+		if nextEvent.Player != modded && nextEvent.EventType != dominos.RoundWin && nextEvent.EventType != dominos.RoundDraw {
+			log.Fatal("Not what you expected: ", gameEvent.Player, " ", nextEvent.Player, " ", gameEvent.EventType, " ", nextEvent.EventType, " ", gameEvent.Card, " ", nextEvent.Card)
 		}
+
+		switch nextEvent.EventType {
+		case dominos.Passed:
+			if nextEvent.Player == 0 {
+				reward = reward - 3.0*float64(7-nextEvent.PlayerCardsRemaining[nextEvent.Player])
+			} else if !chainBroken {
+				reward = reward + float64(7-nextEvent.PlayerCardsRemaining[nextEvent.Player]) + float64(nextEvent.Player)
+			}
+		case dominos.PlayedCard:
+			if nextEvent.Player != 0 {
+				chainBroken = true
+			}
+		case dominos.RoundWin:
+			if nextEvent.Player == 0 {
+				reward = reward + 100.0
+			} else {
+				reward = reward - 100.0
+			}
+		}
+	}
+	if hasHardEnd {
+		reward = -7.0
+	} else if isDouble {
+		reward = 15.0
 	}
 
+	cardChoice[index] = reward
 	res := tensor.New(tensor.WithShape(56), tensor.WithBacking(cardChoice[:]))
 	return res
 }
@@ -590,14 +614,8 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 		return &dominos.CardChoice{}, err
 	}
 
-	// Wef cant predict dominoes not in our hand
-	outputMask := j.GetOutputMask(gameEvent)
-	_, err = tensor.Mul(prediction, outputMask, tensor.UseUnsafe())
-	if err != nil {
-		return &dominos.CardChoice{}, err
-	}
-
-	choice := &dominos.CardChoice{}
+	card, side := j.ComputerPlayer.PlayCard(gameEvent, dominos.GetCLIDominos())
+	choice := &dominos.CardChoice{Card: card, Side: side}
 	cardConfidences, ok := prediction.Data().([]float64)
 	maxConfidence := -100000000000.0
 	contained := func(card uint) bool {
@@ -620,6 +638,10 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 
 	compatible := func(card uint, side dominos.BoardSide) bool {
 		compatibleCard := false
+		if card > 27 {
+			log.Error("Too big")
+			return false
+		}
 		suit1, suit2 := dominos.GetCLIDominos()[card].GetSuits()
 		if side == dominos.Left {
 			if suit1 == gameEvent.BoardState.LeftSuit || suit2 == gameEvent.BoardState.LeftSuit {
@@ -632,10 +654,10 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 		}
 		return compatibleCard
 	}
+	somethingFound := false
 	if ok {
 		for i, cardConfidence := range cardConfidences {
 			if cardConfidence > maxConfidence {
-
 				side := dominos.Left
 				card := i
 				if i > 27 {
@@ -646,14 +668,28 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 					choice.Card = uint(card)
 					choice.Side = side
 					maxConfidence = cardConfidence
+					somethingFound = true
 				}
 
 			}
 		}
 	}
-	if maxConfidence < 0 {
-		log.Infof("Card Choice: %+#v, Confidence: %.5f", choice, maxConfidence)
+	if !ok {
+		log.Fatal("Failure to get prediction")
 	}
+
+	if !somethingFound {
+		log.Errorf("No card to play found. Max confidence: %.7f Player: %d Hand: %#v Hand2: %#v Confidences: %#v Event: %s", maxConfidence, gameEvent.Player, gameEvent.PlayerHands[gameEvent.Player], j.GetHand(), cardConfidences, gameEvent.EventType)
+		hand := gameEvent.PlayerHands[gameEvent.Player]
+		for i := range hand {
+			log.Warn(" ", hand[i], " ", compatible(hand[i], "left"), " ", compatible(hand[i], "right"))
+		}
+	}
+	// if maxConfidence < 0 {
+	// 	log.Infof("Card Choice: %+#v, Confidence: %.5f Confidences %+#v", choice, maxConfidence, cardConfidences)
+	// } else {
+	// 	log.Infof("Card Choice: %+#v, Confidence: %.5f Confidences %+#v", choice, maxConfidence, cardConfidences)
+	// }
 
 	return choice, nil
 }
@@ -738,14 +774,6 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 	}
 
 	pred, err := final.Apply(relu, tensor.UseSafe())
-	if err != nil {
-		log.Fatal(err, " ", "4")
-		return 0.0, err
-	}
-
-	// We cant predict dominoes not in our hand
-	outputMask := j.GetOutputMask(gameEvent)
-	_, err = tensor.Mul(pred, outputMask, tensor.UseUnsafe())
 	if err != nil {
 		log.Fatal(err, " ", "4")
 		return 0.0, err
@@ -976,7 +1004,7 @@ func (j *JSDNN) Train(gameEvent *dominos.GameEvent, learnRate float64) (float64,
 	return j.train(x, y, gameEvent, learnRate)
 }
 
-func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64, nextGameEvents [4]*dominos.GameEvent, finalGameEvent *dominos.GameEvent) (float64, error) {
+func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64, nextGameEvents [12]*dominos.GameEvent) (float64, error) {
 	if gameEvent.EventType != dominos.PlayedCard && gameEvent.EventType != dominos.PosedCard {
 		return 0.0, errors.New("Invalid game event to train with")
 	}
@@ -985,7 +1013,7 @@ func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64,
 		log.Debug("If there is only one choice, no need to train it")
 		return 0.0, nil
 	}
-	y := j.ConvertCardChoiceToTensorReinforced(gameEvent, finalGameEvent)
+	y := j.ConvertCardChoiceToTensorReinforced(gameEvent, nextGameEvents)
 
 	err := x.Reshape(x.Shape()[0], 1)
 	if err != nil {
@@ -1119,39 +1147,15 @@ func (j *JSDNN) PoseCard(doms []dominos.Domino) uint {
 		}
 	}
 
-	gameEvent := &dominos.GameEvent{
-		EventType: dominos.PlayerTurn, Player: 0,
-		BoardState: &dominos.Board{}, PlayerWins: [4]int{},
-		PoseModeDoubleSix:    false,
-		PlayerCardsRemaining: [4]int{7, 7, 7, 7}, GameState: dominos.ExecutePlayerPose,
-		PlayerHands: [4][]uint{j.ComputerPlayer.GetHand(), {}, {}, {}},
-	}
-
-	cardChoice, err := j.Predict(gameEvent)
-	if err != nil {
-		log.Warn("Error predicting using AI")
-		return j.ComputerPlayer.PoseCard(doms)
-	}
-
-	cardChoiceInHand := false
-	for i := range j.GetHand() {
-		if hand[i] == cardChoice.Card {
-			cardChoiceInHand = true
-		}
-	}
-	if !cardChoiceInHand {
-		return j.ComputerPlayer.PoseCard(doms)
-	}
-
-	return cardChoice.Card
+	return j.ComputerPlayer.PoseCard(doms)
 }
 
 func (j *JSDNN) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (uint, dominos.BoardSide) {
 	gameEvent = jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
 
 	cardChoice, err := j.Predict(gameEvent)
-	if err != nil {
-		log.Warn("Error predicting using AI")
+	if err != nil || cardChoice.Card > 27 {
+		log.Warn("Error predicting using AI: ", err)
 		return j.ComputerPlayer.PlayCard(gameEvent, doms)
 	}
 	typ := "predict"

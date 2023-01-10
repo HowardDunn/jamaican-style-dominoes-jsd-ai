@@ -236,8 +236,8 @@ func trainReinforced() {
 	// Train Reinforcement
 	start := time.Now()
 	hiddenLayerNodes1 := 150
-	learnRate := 0.001
-	sameGameIterations := 1
+	learnRate := 0.1
+	sameGameIterations := 5
 	totalRoundWins := [4]int{}
 	jsdai1 := nn.New(126, []int{150, 150}, 56)
 	jsdai2 := nn.New(126, []int{hiddenLayerNodes1}, 56)
@@ -250,8 +250,8 @@ func trainReinforced() {
 	jsdai3.Load("./results/" + "jasai3.mdl")
 	jsdai4.Load("./results/" + "jasai4.mdl")
 
-	jsdai3.Search = false
-	jsdai3.SearchNum = 8000
+	jsdai4.Search = false
+	jsdai4.SearchNum = 1000
 	reinForceMentLearn := func(r int64) {
 		iter := func(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, totWins [4]*int, rand int64) {
 			dominosGame := dominos.NewLocalGame(dp, int64(rand), "cutthroat")
@@ -263,7 +263,7 @@ func trainReinforced() {
 				// log.Infof("LastGame Event: %+#v", lastGameEvent)
 				lGE := jsdonline.CopyandRotateGameEvent(lastGameEvent, 0)
 
-				if lGE.EventType == dominos.PosedCard || lGE.EventType == dominos.PlayedCard ||
+				if lGE.EventType == dominos.PlayedCard ||
 					lGE.EventType == dominos.Passed || lastGameEvent.EventType == dominos.RoundWin ||
 					lastGameEvent.EventType == dominos.RoundDraw {
 					roundGameEvents = append(roundGameEvents, lGE)
@@ -271,19 +271,19 @@ func trainReinforced() {
 
 				if lastGameEvent.EventType == dominos.RoundWin {
 					for i, gameEvent := range roundGameEvents {
-						if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {
+						if gameEvent.EventType == dominos.PlayedCard {
 
 							jsdai := nnPlayers[gameEvent.Player]
 							rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
 							// Get the next 4 relevant events
-							nextFourRelevant := [4]*dominos.GameEvent{}
+							nextTwelveRelevant := [12]*dominos.GameEvent{}
 							for j := 1; j < 5; j++ {
-								if (i + j) > len(roundGameEvents) {
+								if (i + j) >= len(roundGameEvents) {
 									break
 								}
-								nextFourRelevant[j-1] = jsdonline.CopyandRotateGameEvent(roundGameEvents[i], gameEvent.Player)
+								nextTwelveRelevant[j-1] = jsdonline.CopyandRotateGameEvent(roundGameEvents[i+j], gameEvent.Player)
 							}
-							cost, err := jsdai.TrainReinforced(rotatedGameEvent, learnRate, nextFourRelevant, lastGameEvent)
+							cost, err := jsdai.TrainReinforced(rotatedGameEvent, learnRate, nextTwelveRelevant)
 							if err != nil {
 								log.Fatal("Error training: ", err)
 							}
@@ -325,24 +325,23 @@ func trainReinforced() {
 			iter(gp, nnPlayers, tots, r)
 		}
 
-		// for i := 0; i < sameGameIterations; i++ {
-		// 	// TODO: bar
-		// 	log.Info("ITER: ", i)
-		// 	nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
-		// 	rand.Shuffle(len(nnPlayers), func(i, j int) { nnPlayers[i], nnPlayers[j] = nnPlayers[j], nnPlayers[i] })
-		// 	gp := [4]dominos.Player{nnPlayers[0], nnPlayers[1], nnPlayers[2], nnPlayers[3]}
-		// 	tots := [4]*int{&nnPlayers[0].TotalWins2, &nnPlayers[1].TotalWins2, &nnPlayers[2].TotalWins2, &nnPlayers[3].TotalWins2}
-		// 	randNum := rand.Int63n(9223372036854775607)
-		// 	iter(gp, nnPlayers, tots, randNum)
-		// }
+		for i := 0; i < sameGameIterations; i++ {
+			// TODO: bar
+			nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
+			rand.Shuffle(len(nnPlayers), func(i, j int) { nnPlayers[i], nnPlayers[j] = nnPlayers[j], nnPlayers[i] })
+			gp := [4]dominos.Player{nnPlayers[0], nnPlayers[1], nnPlayers[2], nnPlayers[3]}
+			tots := [4]*int{&nnPlayers[0].TotalWins2, &nnPlayers[1].TotalWins2, &nnPlayers[2].TotalWins2, &nnPlayers[3].TotalWins2}
+			randNum := rand.Int63n(9223372036854775607)
+			iter(gp, nnPlayers, tots, randNum)
+		}
 
-		// for i := 0; i < sameGameIterations; i++ {
-		// 	// TODO: bar
-		// 	nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
-		// 	gp := [4]dominos.Player{nnPlayers[0], &dominos.ComputerPlayer{}, nnPlayers[3], jc}
-		// 	tots := [4]*int{&totalRoundWins[0], &totalRoundWins[1], &totalRoundWins[2], &totalRoundWins[3]}
-		// 	iter(gp, nnPlayers, tots)
-		// }
+		for i := 0; i < sameGameIterations; i++ {
+			// TODO: bar
+			nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
+			gp := [4]dominos.Player{nnPlayers[0], &dominos.ComputerPlayer{RandomMode: true}, nnPlayers[3], jc}
+			tots := [4]*int{&totalRoundWins[0], &totalRoundWins[1], &totalRoundWins[2], &totalRoundWins[3]}
+			iter(gp, nnPlayers, tots, r)
+		}
 	}
 
 	randomSeed := time.Now().UnixNano()
@@ -353,11 +352,11 @@ func trainReinforced() {
 		reinForceMentLearn(randNum)
 		log.Info("Games Seen: ", j+1)
 		log.Debug("Player Wins: ", totalRoundWins, " Total Rounds: ", totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		// r1 := float64(totalRoundWins[0]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		// r2 := float64(totalRoundWins[1]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		// r3 := float64(totalRoundWins[2]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		// r4 := float64(totalRoundWins[3]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		// log.Info("Player Ratios: ", []float64{r1, r2, r3, r4})
+		r1 := float64(totalRoundWins[0]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		r2 := float64(totalRoundWins[1]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		r3 := float64(totalRoundWins[2]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		r4 := float64(totalRoundWins[3]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		log.Info("Player Ratios: ", []float64{r1, r2, r3, r4})
 		log.Info("NN Wins: ", []int{jsdai1.TotalWins, jsdai2.TotalWins, jsdai3.TotalWins, jsdai4.TotalWins})
 		log.Info("NN Wins2: ", []int{jsdai1.TotalWins2, jsdai2.TotalWins2, jsdai3.TotalWins2, jsdai4.TotalWins2})
 		n1 := float64(jsdai1.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
@@ -409,25 +408,30 @@ func duppyPlay() {
 			if !joinedGame {
 				if table.GameType == "cutthroat" && table.GameState == "waiting" {
 					log.Infof("%+#v", table)
-					position := 0
+					openPositions := []int{}
 					users := []string{table.Player1.Username, table.Player2.Username, table.Player3.Username, table.Player4.Username}
 					for i, user := range users {
 						if user == "" {
-							position = i
-							break
+							openPositions = append(openPositions, i)
 						}
 					}
-					gamePayload := &duppy.OnlineGamePayload{
-						GameID:   table.GameID,
-						Position: position,
+					randomSeed := time.Now().UnixNano()
+					rand.Seed(randomSeed)
+					rand.Shuffle(len(openPositions), func(i, j int) { openPositions[i], openPositions[j] = openPositions[j], openPositions[i] })
+					if len(openPositions) > 0 {
+						gamePayload := &duppy.OnlineGamePayload{
+							GameID:   table.GameID,
+							Position: openPositions[0],
+						}
+
+						err := duppy.JoinOnlineGame(gamePayload, token)
+						if err != nil {
+							log.Error(err)
+							continue
+						}
+						joinedGame = true
 					}
 
-					err := duppy.JoinOnlineGame(gamePayload, token)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					joinedGame = true
 					break
 				}
 			}
@@ -440,6 +444,6 @@ func duppyPlay() {
 func main() {
 	trainReinforced()
 	// trainHuman()
-	// 69 / 333, 80/367
+	// 69 / 333, 80/367, 194,997
 	// duppyPlay()
 }

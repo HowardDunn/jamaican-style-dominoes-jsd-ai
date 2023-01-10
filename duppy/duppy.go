@@ -143,9 +143,9 @@ func GetOnlineTableList(token string) ([]*OnlineGameTable, error) {
 }
 
 func PlayGame(game *OnlineGameTable, token string) {
-	jsdAI := nn.New(126, []int{20, 25}, 56)
+	jsdAI := nn.New(126, []int{56, 56}, 56)
 	jsdAI.Search = true
-	jsdAI.SearchNum = 10000
+	jsdAI.SearchNum = 5000
 	err := jsdAI.Load("./results/duppy.mdl")
 	if err != nil {
 		log.Error("Error: ", err)
@@ -187,24 +187,24 @@ func PlayGame(game *OnlineGameTable, token string) {
 		} else if lastGameEvent.EventType == dominos.RoundWin || lastGameEvent.EventType == dominos.RoundDraw {
 			jsdAI.ResetPassMemory()
 		} else if lastGameEvent.EventType == dominos.GameWin || g.ConnectionCount > 100 {
-			g.Reset(0, "partner")
+			g.Reset(0, "cutthroat")
 			jsdAI.ResetPassMemory()
-			for _, gameEvent := range roundGameEvents {
-				if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {
-					rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
-					_, err := jsdAI.TrainReinforced(rotatedGameEvent, 0.001, lastGameEvent)
-					if err != nil {
-						log.Error("Error training: ", err)
-						return
-					}
-				} else if gameEvent.EventType == dominos.Passed {
-					jsdAI.UpdatePassMemory(gameEvent)
-				} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
-					jsdAI.ResetPassMemory()
-				}
-			}
-			roundGameEvents = []*dominos.GameEvent{}
-			jsdAI.Save("duppy2.mdl")
+			// for _, gameEvent := range roundGameEvents {
+			// 	if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {
+			// 		rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
+			// 		_, err := jsdAI.TrainReinforced(rotatedGameEvent, 0.001, lastGameEvent)
+			// 		if err != nil {
+			// 			log.Error("Error training: ", err)
+			// 			return
+			// 		}
+			// 	} else if gameEvent.EventType == dominos.Passed {
+			// 		jsdAI.UpdatePassMemory(gameEvent)
+			// 	} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
+			// 		jsdAI.ResetPassMemory()
+			// 	}
+			// }
+			// roundGameEvents = []*dominos.GameEvent{}
+			// jsdAI.Save("duppy2.mdl")
 			return
 		}
 
