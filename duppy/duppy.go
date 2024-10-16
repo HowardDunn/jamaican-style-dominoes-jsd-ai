@@ -143,9 +143,9 @@ func GetOnlineTableList(token string) ([]*OnlineGameTable, error) {
 }
 
 func PlayGame(game *OnlineGameTable, token string) {
-	jsdAI := nn.New(126, []int{56, 56}, 56)
+	jsdAI := nn.New(126, []int{32, 32}, 56)
 	jsdAI.Search = true
-	jsdAI.SearchNum = 5000
+	jsdAI.SearchNum = 1000
 	err := jsdAI.Load("./results/duppy.mdl")
 	if err != nil {
 		log.Error("Error: ", err)

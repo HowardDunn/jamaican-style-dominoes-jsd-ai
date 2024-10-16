@@ -159,6 +159,10 @@ func (*JSDNN) GetPlayerType() string {
 	return "localHumanPlayer"
 }
 
+func (j *JSDNN) GetNumHidden() int {
+	return len(j.hidden)
+}
+
 func (j *JSDNN) UpdatePassMemory(gameEvent *dominos.GameEvent) {
 	gameEvent = jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
 	card := gameEvent.Card
@@ -296,7 +300,7 @@ func (j *JSDNN) ConvertCardChoiceToTensor(gameEvent *dominos.GameEvent) tensor.T
 	return res
 }
 
-func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent, nextGameEvents [12]*dominos.GameEvent) tensor.Tensor {
+func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent, nextGameEvents [16]*dominos.GameEvent) tensor.Tensor {
 	// Since the agent will want to maximize the reward, lets reward for every time it is able to play the next turn
 	// I think it makes sense to look at the 4 events, the relevant events, pass, play card, round win
 
@@ -307,7 +311,7 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 		index = index + 28
 		suitPlayed = gameEvent.BoardState.RightSuit
 	}
-	reward := 1.0
+	reward := 0.0
 	chainBroken := false
 	hasHardEnd := false
 	boardSuitCount := gameEvent.BoardState.CountSuit(suitPlayed)
@@ -316,8 +320,10 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 	if boardSuitCount+handSuitCount == 6 {
 		hasHardEnd = true
 	}
+	won := false
+	wonByBlock := true
 	for i, nextEvent := range nextGameEvents {
-		if nextEvent == nil {
+		if nextEvent == nil || i > 4 {
 			break
 		}
 		modded := (i + 1) % 4
@@ -328,9 +334,9 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 		switch nextEvent.EventType {
 		case dominos.Passed:
 			if nextEvent.Player == 0 {
-				reward = reward - 3.0*float64(7-nextEvent.PlayerCardsRemaining[nextEvent.Player])
+				reward = -1.0
 			} else if !chainBroken {
-				reward = reward + float64(7-nextEvent.PlayerCardsRemaining[nextEvent.Player]) + float64(nextEvent.Player)
+				reward = reward + 1.0
 			}
 		case dominos.PlayedCard:
 			if nextEvent.Player != 0 {
@@ -338,16 +344,34 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 			}
 		case dominos.RoundWin:
 			if nextEvent.Player == 0 {
-				reward = reward + 100.0
+				reward = 7.0
+				won = true
 			} else {
-				reward = reward - 100.0
+				reward = -7.0
+				wonByBlock = false
 			}
+
+			for j := 0; j < len(nextEvent.PlayerCardsRemaining); j++ {
+				if nextEvent.PlayerCardsRemaining[j] == 0 {
+					wonByBlock = false
+					break
+				}
+			}
+		case dominos.RoundDraw:
+			wonByBlock = false
 		}
 	}
-	if hasHardEnd {
-		reward = -7.0
-	} else if isDouble {
+
+	if !won {
+		wonByBlock = false
+	}
+	if hasHardEnd && !won {
+		reward = -15.0
+	} else if isDouble && !won {
 		reward = 15.0
+	}
+	if wonByBlock {
+		reward = reward * 1.5
 	}
 
 	cardChoice[index] = reward
@@ -1004,7 +1028,7 @@ func (j *JSDNN) Train(gameEvent *dominos.GameEvent, learnRate float64) (float64,
 	return j.train(x, y, gameEvent, learnRate)
 }
 
-func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64, nextGameEvents [12]*dominos.GameEvent) (float64, error) {
+func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64, nextGameEvents [16]*dominos.GameEvent) (float64, error) {
 	if gameEvent.EventType != dominos.PlayedCard && gameEvent.EventType != dominos.PosedCard {
 		return 0.0, errors.New("Invalid game event to train with")
 	}
@@ -1158,8 +1182,11 @@ func (j *JSDNN) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (u
 		log.Warn("Error predicting using AI: ", err)
 		return j.ComputerPlayer.PlayCard(gameEvent, doms)
 	}
+	_, compatL, compatR := j.ConvertGameEventToTensor(gameEvent)
+
+	choices := compatL + compatR
 	typ := "predict"
-	if j.Search {
+	if j.Search && choices > 1 && gameEvent.PlayerCardsRemaining[0] < 5 {
 		cardChoiceSearch, probability, err := j.PredictSearch(gameEvent, j.SearchNum, 0.001)
 		if err != nil {
 			log.Warn("Error predicting Search using AI")
@@ -1171,7 +1198,7 @@ func (j *JSDNN) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (u
 			sameChoice = false
 		}
 
-		if sameChoice && probability < 0.285 && !doms[cardChoice.Card].IsDouble() {
+		if sameChoice && probability < 0.01 && !doms[cardChoice.Card].IsDouble() {
 			explorer := New(j.inputDim, j.hiddenDim, j.outputDim)
 			cardChoiceExplorer, err := explorer.Predict(gameEvent)
 			if err == nil {
@@ -1191,7 +1218,7 @@ func (j *JSDNN) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (u
 				}
 				typ = "explored"
 			}
-		} else if probability > 0.35 && !sameChoice {
+		} else if probability > 0.90 && !sameChoice {
 			cardChoice = cardChoiceSearch
 			log.Infof("Better choice %+#v Probab %.2f", cardChoiceSearch, probability)
 			typ = "better"
