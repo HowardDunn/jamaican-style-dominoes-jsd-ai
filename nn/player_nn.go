@@ -40,8 +40,8 @@ type JSDNN struct {
 
 func fillRandom(a []float64, v float64) {
 	dist := distuv.Uniform{
-		Min: -1 / math.Sqrt(v),
-		Max: 1 / math.Sqrt(v),
+		Min: -math.Sqrt(6.0 / v),
+		Max: math.Sqrt(6.0 / v),
 	}
 	for i := range a {
 		a[i] = dist.Rand()
@@ -69,7 +69,7 @@ func New(input int, hidden []int, output int) *JSDNN {
 	bHidden := []*tensor.Dense{}
 	rb := make([]float64, hidden[0])
 	r3 = append(r3, rb)
-	fillRandom(r, float64(len(r)))
+	fillRandom(r, float64(input))
 	fillRandom(r3[0], float64(len(r3[0])))
 	hiddenT = append(hiddenT, tensor.New(tensor.WithShape(hidden[0], input), tensor.WithBacking(r)))
 	bHidden = append(bHidden, tensor.New(tensor.WithShape(hidden[0]), tensor.WithBacking(r3[0])))
@@ -81,7 +81,7 @@ func New(input int, hidden []int, output int) *JSDNN {
 		}
 		h := make([]float64, hidden[i]*next)
 
-		fillRandom(h, float64(len(h)))
+		fillRandom(h, float64(hidden[i]))
 
 		r2 = append(r2, h)
 
@@ -93,8 +93,6 @@ func New(input int, hidden []int, output int) *JSDNN {
 			bHidden = append(bHidden, tensor.New(tensor.WithShape(hidden[i+1]), tensor.WithBacking(r3[i+1])))
 		}
 	}
-
-	fillRandom(r, float64(len(r)))
 
 	finalT := tensor.New(tensor.WithShape(output, hidden[len(hidden)-1]), tensor.WithBacking(r2[len(r2)-1]))
 	bFinal := tensor.New(tensor.WithShape(output), tensor.WithBacking(r4))
@@ -718,7 +716,17 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 	return choice, nil
 }
 
-func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRate float64) (float64, error) {
+func (j *JSDNN) getLearnRate(learnRates []float64, layerIndex int) float64 {
+	if len(learnRates) == 1 {
+		return learnRates[0]
+	}
+	if layerIndex < len(learnRates) {
+		return learnRates[layerIndex]
+	}
+	return learnRates[len(learnRates)-1]
+}
+
+func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRates []float64) (float64, error) {
 	err := x.Reshape(x.Shape()[0], 1)
 	if err != nil {
 		log.Fatal(err, " ", "x")
@@ -883,13 +891,14 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 	hiddenActs[len(hiddenActs)-2].UT()
 
 	// Update the gradients
-	_, err = tensor.Mul(dcost_dfinal, learnRate, tensor.UseUnsafe())
+	finalLR := j.getLearnRate(learnRates, len(j.hidden))
+	_, err = tensor.Mul(dcost_dfinal, finalLR, tensor.UseUnsafe())
 	if err != nil {
 		log.Fatal(err, " ", "14")
 		return 0.0, err
 	}
 
-	_, err = tensor.Mul(dcost_dbiasfinal, learnRate, tensor.UseUnsafe())
+	_, err = tensor.Mul(dcost_dbiasfinal, finalLR, tensor.UseUnsafe())
 	if err != nil {
 		log.Fatal(err, " ", "15")
 		return 0.0, err
@@ -909,13 +918,14 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 		return 0.0, err
 	}
 
-	_, err = tensor.Mul(dcost_dbiashidden, learnRate, tensor.UseUnsafe())
+	lastHiddenLR := j.getLearnRate(learnRates, len(j.hidden)-1)
+	_, err = tensor.Mul(dcost_dbiashidden, lastHiddenLR, tensor.UseUnsafe())
 	if err != nil {
 		log.Fatal(err, " ", "15")
 		return 0.0, err
 	}
 
-	_, err = tensor.Mul(dcost_dhidden, learnRate, tensor.UseUnsafe())
+	_, err = tensor.Mul(dcost_dhidden, lastHiddenLR, tensor.UseUnsafe())
 	if err != nil {
 		log.Fatal(err, " ", "15")
 		return 0.0, err
@@ -934,7 +944,6 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 	}
 
 	// Calculate the update for the rest of the hidden layers
-
 	j.hidden[len(j.hidden)-1].T()
 	hErrs, err = tensor.MatMul(j.hidden[len(j.hidden)-1], hErrs)
 	if err != nil {
@@ -975,13 +984,14 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 		}
 		hiddenActs[i-1].UT()
 
-		_, err = tensor.Mul(dcost_dbiashidden, learnRate, tensor.UseUnsafe())
+		hiddenLR := j.getLearnRate(learnRates, i-1)
+		_, err = tensor.Mul(dcost_dbiashidden, hiddenLR, tensor.UseUnsafe())
 		if err != nil {
 			log.Fatal(err, " ", "15")
 			return 0.0, err
 		}
 
-		_, err = tensor.Mul(dcost_dhidden, learnRate, tensor.UseUnsafe())
+		_, err = tensor.Mul(dcost_dhidden, hiddenLR, tensor.UseUnsafe())
 		if err != nil {
 			log.Fatal(err, " ", "15")
 			return 0.0, err
@@ -1014,7 +1024,7 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 	return cost, nil
 }
 
-func (j *JSDNN) Train(gameEvent *dominos.GameEvent, learnRate float64) (float64, error) {
+func (j *JSDNN) Train(gameEvent *dominos.GameEvent, learnRates []float64) (float64, error) {
 	if gameEvent.EventType != dominos.PlayedCard && gameEvent.EventType != dominos.PosedCard {
 		return 0.0, errors.New("Invalid game event to train with")
 	}
@@ -1025,10 +1035,10 @@ func (j *JSDNN) Train(gameEvent *dominos.GameEvent, learnRate float64) (float64,
 	}
 	y := j.ConvertCardChoiceToTensor(gameEvent)
 
-	return j.train(x, y, gameEvent, learnRate)
+	return j.train(x, y, gameEvent, learnRates)
 }
 
-func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64, nextGameEvents [16]*dominos.GameEvent) (float64, error) {
+func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRates []float64, nextGameEvents [16]*dominos.GameEvent) (float64, error) {
 	if gameEvent.EventType != dominos.PlayedCard && gameEvent.EventType != dominos.PosedCard {
 		return 0.0, errors.New("Invalid game event to train with")
 	}
@@ -1051,7 +1061,7 @@ func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRate float64,
 		return 0.0, err
 	}
 
-	return j.train(x, y, gameEvent, learnRate)
+	return j.train(x, y, gameEvent, learnRates)
 }
 
 func (j *JSDNN) Save(fileName string) error {

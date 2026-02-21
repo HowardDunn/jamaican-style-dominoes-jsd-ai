@@ -170,7 +170,7 @@ func trainHuman() {
 					if !ok && filterUsers {
 						continue
 					}
-					cost, err := jsdai.Train(rotatedGameEvent, learnRate)
+					cost, err := jsdai.Train(rotatedGameEvent, []float64{learnRate})
 					if err != nil {
 						log.Fatal("Error training: ", err)
 					}
@@ -240,7 +240,7 @@ func trainReinforced() {
 	// Train Reinforcement
 	start := time.Now()
 
-	sameGameIterations := 16
+	sameGameIterations := 8
 	totalRoundWins := [4]int{}
 	jsdai1 := nn.New(126, []int{150}, 56)
 	jsdai2 := nn.New(126, []int{64, 64}, 56)
@@ -290,7 +290,7 @@ func trainReinforced() {
 							if jsdai.GetNumHidden() == 1 {
 								learnRate = 0.001
 							}
-							_, err := jsdai.TrainReinforced(rotatedGameEvent, learnRate, nextRelevant)
+							_, err := jsdai.TrainReinforced(rotatedGameEvent, []float64{learnRate}, nextRelevant)
 							if err != nil {
 								log.Fatal("Error training: ", err)
 							}
@@ -370,7 +370,7 @@ func trainReinforced() {
 	randomSeed := time.Now().UnixNano()
 	log.Info("Using random Seed: ", randomSeed)
 	rand.Seed(randomSeed)
-	for j := 0; j < 10000000; j++ {
+	for j := 0; j < 5000000; j++ {
 		randNum := rand.Int63n(9223372036854775607)
 		reinForceMentLearn(randNum)
 		log.Info("Games Seen: ", j+1)
@@ -495,7 +495,7 @@ func duppyPlay() {
 
 func main() {
 	// trainReinforced()
-	// trainHuman()
+	trainHuman()
 	// 69 / 333, 80/367, 194,997. 205,1085
-	duppyPlay()
+	// duppyPlay()
 }
