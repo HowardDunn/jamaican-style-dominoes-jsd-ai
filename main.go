@@ -459,6 +459,45 @@ func trainReinforced() {
 
 	masters := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
 
+	// Rolling window buffers (last 1000 iterations) for win tracking
+	const rollingSize = 1000
+	rollingNN := [4][]int{}       // Phase 1: NN vs NN wins per iteration
+	rollingNN2 := [4][]int{}      // Phase 2: shuffled NN vs NN wins per iteration
+	rollingBench := [4][]int{}    // Phase 3: benchmark vs random wins per iteration
+	rollingIdx := 0
+	rollingCount := 0
+
+	rollingRatios := func(buf [4][]int, count int) []float64 {
+		total := 0
+		sums := [4]int{}
+		n := count
+		if n > rollingSize {
+			n = rollingSize
+		}
+		for p := 0; p < 4; p++ {
+			for i := 0; i < n; i++ {
+				sums[p] += buf[p][i]
+			}
+			total += sums[p]
+		}
+		if total == 0 {
+			return []float64{0, 0, 0, 0}
+		}
+		return []float64{
+			float64(sums[0]) / float64(total),
+			float64(sums[1]) / float64(total),
+			float64(sums[2]) / float64(total),
+			float64(sums[3]) / float64(total),
+		}
+	}
+
+	// Pre-allocate ring buffers
+	for p := 0; p < 4; p++ {
+		rollingNN[p] = make([]int, rollingSize)
+		rollingNN2[p] = make([]int, rollingSize)
+		rollingBench[p] = make([]int, rollingSize)
+	}
+
 	reinForceMentLearn := func(r int64) {
 		// Phase 1: Fixed-order NN players, parallel game simulation
 		seeds := make([]int64, sameGameIterations)
@@ -485,10 +524,14 @@ func trainReinforced() {
 
 		// Apply training sequentially on master NNs
 		applyTraining(masters, results)
-		// Accumulate wins
+		// Accumulate wins and record rolling window
+		for p := 0; p < 4; p++ {
+			rollingNN[p][rollingIdx] = 0
+		}
 		for _, r := range results {
 			for k := 0; k < 4; k++ {
 				masters[k].TotalWins += r.playerWins[k]
+				rollingNN[k][rollingIdx] += r.playerWins[k]
 			}
 		}
 
@@ -527,6 +570,9 @@ func trainReinforced() {
 		wg.Wait()
 
 		// Apply training with shuffled ordering (map back to master NNs)
+		for p := 0; p < 4; p++ {
+			rollingNN2[p][rollingIdx] = 0
+		}
 		for ri, result := range results2 {
 			sg := shuffledGames[ri]
 			shuffledMasters := [4]*nn.JSDNN{masters[sg.order[0]], masters[sg.order[1]], masters[sg.order[2]], masters[sg.order[3]]}
@@ -534,6 +580,7 @@ func trainReinforced() {
 			// Accumulate wins to the correct master's TotalWins2
 			for k := 0; k < 4; k++ {
 				shuffledMasters[k].TotalWins2 += result.playerWins[k]
+				rollingNN2[sg.order[k]][rollingIdx] += result.playerWins[k]
 			}
 		}
 
@@ -585,9 +632,13 @@ func trainReinforced() {
 
 		// Benchmark is evaluation-only — do NOT train on random players' moves
 		// Accumulate benchmark wins using the shuffled ordering
+		for p := 0; p < 4; p++ {
+			rollingBench[p][rollingIdx] = 0
+		}
 		for _, result := range results3 {
 			for k := 0; k < 4; k++ {
 				totalRoundWins[benchOrder[k]] += result.playerWins[k]
+				rollingBench[benchOrder[k]][rollingIdx] += result.playerWins[k]
 			}
 		}
 
@@ -596,6 +647,10 @@ func trainReinforced() {
 		jsdai2.Epsilon = savedEpsilon[1]
 		jsdai3.Epsilon = savedEpsilon[2]
 		jsdai4.Epsilon = savedEpsilon[3]
+
+		// Advance rolling window
+		rollingIdx = (rollingIdx + 1) % rollingSize
+		rollingCount++
 
 		// Save models and metadata once per batch
 		iterationCount++
@@ -638,11 +693,14 @@ func trainReinforced() {
 		n3 := float64(jsdai3.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
 		n4 := float64(jsdai4.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
 		log.Info("NN Ratios: ", []float64{n1, n2, n3, n4})
+		log.Info("NN Ratios Rolling 1k: ", rollingRatios(rollingNN, rollingCount))
 		n21 := float64(jsdai1.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
 		n22 := float64(jsdai2.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
 		n23 := float64(jsdai3.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
 		n24 := float64(jsdai4.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
 		log.Info("NN Ratios2: ", []float64{n21, n22, n23, n24})
+		log.Info("NN Ratios2 Rolling 1k: ", rollingRatios(rollingNN2, rollingCount))
+		log.Info("Bench Ratios Rolling 1k: ", rollingRatios(rollingBench, rollingCount))
 		if j > 1 {
 			jsdai1.Search = false
 			jsdai2.Search = false
