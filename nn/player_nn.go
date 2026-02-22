@@ -385,6 +385,9 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 		reward = reward * 1.5
 	}
 
+	// Normalize reward from [-7, 10.5] to [0, 1] for stable linear output training
+	reward = (reward + 7.0) / 17.5
+
 	cardChoice[index] = reward
 	res := tensor.New(tensor.WithShape(56), tensor.WithBacking(cardChoice[:]))
 	return res
