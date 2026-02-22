@@ -259,14 +259,13 @@ func updateEloBench(currentElo float64, wins, totalGames int) float64 {
 	}
 	expected := 1.0 / (1.0 + math.Pow(10, (eloRandomPlayer-currentElo)/400.0))
 	actual := float64(wins) / float64(totalGames)
-	// Scale K by number of games for smoother updates
-	return currentElo + eloK*float64(totalGames)/4.0*(actual-expected)
+	return currentElo + eloK*(actual-expected)
 }
 
 // updateEloMultiplayer updates Elo ratings for a 4-player game.
 // Each player's expected score is the average of pairwise expected scores vs the other 3.
 // playerWins contains the round wins per position, ratings contains current Elos per position.
-func updateEloMultiplayer(ratings [4]float64, playerWins [4]int) [4]float64 {
+func updateEloMultiplayer(ratings [4]float64, playerWins [4]int, numGames int) [4]float64 {
 	totalWins := 0
 	for _, w := range playerWins {
 		totalWins += w
@@ -276,6 +275,8 @@ func updateEloMultiplayer(ratings [4]float64, playerWins [4]int) [4]float64 {
 	}
 
 	newRatings := ratings
+	// Scale K down by number of games since this is called per-game
+	k := eloK / float64(numGames)
 	for i := 0; i < 4; i++ {
 		// Expected score: average of pairwise expected scores vs each opponent
 		expectedSum := 0.0
@@ -288,7 +289,7 @@ func updateEloMultiplayer(ratings [4]float64, playerWins [4]int) [4]float64 {
 		expected := expectedSum / 3.0 // average pairwise expected score
 
 		actual := float64(playerWins[i]) / float64(totalWins)
-		newRatings[i] = ratings[i] + eloK*(actual-expected)
+		newRatings[i] = ratings[i] + k*(actual-expected)
 	}
 	return newRatings
 }
@@ -595,7 +596,7 @@ func trainReinforced() {
 				rollingNN[k][rollingIdx] += r.playerWins[k]
 			}
 			// Update Elo from NN-vs-NN game (fixed order: position k = masters[k])
-			elos = updateEloMultiplayer(elos, r.playerWins)
+			elos = updateEloMultiplayer(elos, r.playerWins, sameGameIterations)
 		}
 
 		// Phase 2: Shuffled NN players, parallel game simulation
@@ -647,7 +648,7 @@ func trainReinforced() {
 			}
 			// Update Elo: remap position wins to master Elo indices
 			shuffledElos := [4]float64{elos[sg.order[0]], elos[sg.order[1]], elos[sg.order[2]], elos[sg.order[3]]}
-			newShuffledElos := updateEloMultiplayer(shuffledElos, result.playerWins)
+			newShuffledElos := updateEloMultiplayer(shuffledElos, result.playerWins, sameGameIterations)
 			for k := 0; k < 4; k++ {
 				elos[sg.order[k]] = newShuffledElos[k]
 			}
