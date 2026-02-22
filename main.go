@@ -416,11 +416,12 @@ func trainReinforced() {
 	start := time.Now()
 
 	sameGameIterations := 8
-	maxGames := 100
+	maxGames := 100000
 	numWorkers := runtime.NumCPU()
-	totalRoundWins := [4]int{}
+	totalRoundWins := [4]int{}  // per-model wins against random
+	totalBenchGames := [4]int{} // per-model total games in benchmark
 	jsdai1 := nn.New(126, []int{202}, 56)
-	jsdai2 := nn.New(126, []int{64, 32}, 56)
+	jsdai2 := nn.New(126, []int{102, 56}, 56)
 	jsdai3 := nn.New(126, []int{204, 102}, 56)
 	jsdai4 := nn.New(126, []int{128, 64}, 56)
 	jsdai1.OutputActivation = "linear"
@@ -461,9 +462,10 @@ func trainReinforced() {
 
 	// Rolling window buffers (last 1000 iterations) for win tracking
 	const rollingSize = 1000
-	rollingNN := [4][]int{}       // Phase 1: NN vs NN wins per iteration
-	rollingNN2 := [4][]int{}      // Phase 2: shuffled NN vs NN wins per iteration
-	rollingBench := [4][]int{}    // Phase 3: benchmark vs random wins per iteration
+	rollingNN := [4][]int{}         // Phase 1: NN vs NN wins per iteration
+	rollingNN2 := [4][]int{}        // Phase 2: shuffled NN vs NN wins per iteration
+	rollingBench := [4][]int{}      // Phase 3: per-model wins vs random per iteration
+	rollingBenchGames := [4][]int{} // Phase 3: per-model total games per iteration
 	rollingIdx := 0
 	rollingCount := 0
 
@@ -496,6 +498,7 @@ func trainReinforced() {
 		rollingNN[p] = make([]int, rollingSize)
 		rollingNN2[p] = make([]int, rollingSize)
 		rollingBench[p] = make([]int, rollingSize)
+		rollingBenchGames[p] = make([]int, rollingSize)
 	}
 
 	reinForceMentLearn := func(r int64) {
@@ -584,61 +587,73 @@ func trainReinforced() {
 			}
 		}
 
-		// Phase 3: Benchmark against random players (no exploration)
+		// Phase 3: Benchmark each model individually against 3 random players (no exploration)
 		savedEpsilon := [4]float64{jsdai1.Epsilon, jsdai2.Epsilon, jsdai3.Epsilon, jsdai4.Epsilon}
 		jsdai1.Epsilon = 0
 		jsdai2.Epsilon = 0
 		jsdai3.Epsilon = 0
 		jsdai4.Epsilon = 0
 
-		// Pre-generate the benchmark shuffle and seeds
-		// Original: positions 0,1,3 are random players, position 2 is nnPlayers[2]
-		benchGP := [4]int{-1, -1, 2, -1} // -1 means random player, index means which NN
-		benchOrder := [4]int{0, 1, 2, 3}
-		rand.Shuffle(4, func(a, b int) {
-			benchGP[a], benchGP[b] = benchGP[b], benchGP[a]
-			benchOrder[a], benchOrder[b] = benchOrder[b], benchOrder[a]
-		})
-
-		benchSeeds := make([]int64, sameGameIterations)
-		for i := range benchSeeds {
-			benchSeeds[i] = rand.Int63n(9223372036854775607)
+		for p := 0; p < 4; p++ {
+			rollingBench[p][rollingIdx] = 0
+			rollingBenchGames[p][rollingIdx] = 0
 		}
 
-		results3 := make([]gameResult, sameGameIterations)
-		for i := 0; i < sameGameIterations; i++ {
+		// Benchmark each of the 4 models: 2 games each against 3 random players
+		type benchResult struct {
+			nnWins    int
+			totalWins int
+		}
+		benchOut := make([]benchResult, 4*2) // 4 models × 2 games
+		benchSeeds := make([]int64, 4*2)
+		benchPositions := make([]int, 4*2)
+		for i := range benchSeeds {
+			benchSeeds[i] = rand.Int63n(9223372036854775607)
+			benchPositions[i] = rand.Intn(4)
+		}
+
+		for i := 0; i < 4*2; i++ {
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(idx int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				clones := cloneNNs(masters)
-				// Set epsilon to 0 on clones for benchmark
-				for k := 0; k < 4; k++ {
-					clones[k].Epsilon = 0
-				}
+				modelIdx := idx / 2
+				pos := benchPositions[idx]
+				clone := masters[modelIdx].Clone()
+				clone.Epsilon = 0
+				clone.Search = masters[modelIdx].Search
+				clone.SearchNum = masters[modelIdx].SearchNum
 				var gp [4]dominos.Player
+				// playGame needs nnPlayers for event collection; use a dummy set
+				dummyNNs := cloneNNs(masters)
 				for k := 0; k < 4; k++ {
-					if benchGP[k] == -1 {
-						gp[k] = &dominos.ComputerPlayer{RandomMode: true}
+					dummyNNs[k].Epsilon = 0
+				}
+				for k := 0; k < 4; k++ {
+					if k == pos {
+						gp[k] = clone
 					} else {
-						gp[k] = clones[benchGP[k]]
+						gp[k] = &dominos.ComputerPlayer{RandomMode: true}
 					}
 				}
-				results3[idx] = playGame(gp, clones, benchSeeds[idx])
+				result := playGame(gp, dummyNNs, benchSeeds[idx])
+				total := 0
+				for k := 0; k < 4; k++ {
+					total += result.playerWins[k]
+				}
+				benchOut[idx] = benchResult{nnWins: result.playerWins[pos], totalWins: total}
 			}(i)
 		}
 		wg.Wait()
 
-		// Benchmark is evaluation-only — do NOT train on random players' moves
-		// Accumulate benchmark wins using the shuffled ordering
-		for p := 0; p < 4; p++ {
-			rollingBench[p][rollingIdx] = 0
-		}
-		for _, result := range results3 {
-			for k := 0; k < 4; k++ {
-				totalRoundWins[benchOrder[k]] += result.playerWins[k]
-				rollingBench[benchOrder[k]][rollingIdx] += result.playerWins[k]
+		// Accumulate per-model benchmark wins and total games
+		for m := 0; m < 4; m++ {
+			for g := 0; g < 2; g++ {
+				totalRoundWins[m] += benchOut[m*2+g].nnWins
+				totalBenchGames[m] += benchOut[m*2+g].totalWins
+				rollingBench[m][rollingIdx] += benchOut[m*2+g].nnWins
+				rollingBenchGames[m][rollingIdx] += benchOut[m*2+g].totalWins
 			}
 		}
 
@@ -680,12 +695,30 @@ func trainReinforced() {
 		randNum := rand.Int63n(9223372036854775607)
 		reinForceMentLearn(randNum)
 		log.Info("Games Seen: ", j+1)
-		log.Info("Total Player Wins 3rd: ", totalRoundWins, " Total Rounds: ", totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		r1 := float64(totalRoundWins[0]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		r2 := float64(totalRoundWins[1]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		r3 := float64(totalRoundWins[2]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		r4 := float64(totalRoundWins[3]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
-		log.Info("Player Ratios: ", []float64{r1, r2, r3, r4})
+		// Per-model benchmark win rates (each model vs 3 random players, 25% = random baseline)
+		for m := 0; m < 4; m++ {
+			rate := 0.0
+			if totalBenchGames[m] > 0 {
+				rate = float64(totalRoundWins[m]) / float64(totalBenchGames[m])
+			}
+			rollingWins := 0
+			rollingGames := 0
+			n := rollingCount
+			if n > rollingSize {
+				n = rollingSize
+			}
+			for i := 0; i < n; i++ {
+				rollingWins += rollingBench[m][i]
+				rollingGames += rollingBenchGames[m][i]
+			}
+			rollingRate := 0.0
+			if rollingGames > 0 {
+				rollingRate = float64(rollingWins) / float64(rollingGames)
+			}
+			log.Infof("Bench %s: total=%.4f (%d/%d)  rolling1k=%.4f (%d/%d)",
+				modelNames[m], rate, totalRoundWins[m], totalBenchGames[m],
+				rollingRate, rollingWins, rollingGames)
+		}
 		log.Info("NN Wins: ", []int{jsdai1.TotalWins, jsdai2.TotalWins, jsdai3.TotalWins, jsdai4.TotalWins})
 		log.Info("NN Wins2: ", []int{jsdai1.TotalWins2, jsdai2.TotalWins2, jsdai3.TotalWins2, jsdai4.TotalWins2})
 		n1 := float64(jsdai1.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
@@ -700,7 +733,6 @@ func trainReinforced() {
 		n24 := float64(jsdai4.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
 		log.Info("NN Ratios2: ", []float64{n21, n22, n23, n24})
 		log.Info("NN Ratios2 Rolling 1k: ", rollingRatios(rollingNN2, rollingCount))
-		log.Info("Bench Ratios Rolling 1k: ", rollingRatios(rollingBench, rollingCount))
 		if j > 1 {
 			jsdai1.Search = false
 			jsdai2.Search = false
