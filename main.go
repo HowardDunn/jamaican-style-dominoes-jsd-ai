@@ -389,11 +389,14 @@ func applyTraining(nnPlayers [4]*nn.JSDNN, results []gameResult) {
 			for _, evt := range playerEvents[playerIdx] {
 				switch evt.eventType {
 				case "train":
-					learnRate := 0.0001
+					var learnRates []float64
 					if jsdai.GetNumHidden() == 1 {
-						learnRate = 0.001
+						learnRates = []float64{0.001}
+					} else {
+						// First hidden layer at full rate, deeper layers 10x slower
+						learnRates = []float64{0.001, 0.0001}
 					}
-					_, err := jsdai.TrainReinforced(evt.gameEvent, []float64{learnRate}, evt.nextEvents)
+					_, err := jsdai.TrainReinforced(evt.gameEvent, learnRates, evt.nextEvents)
 					if err != nil {
 						log.Fatal("Error training: ", err)
 					}
@@ -580,8 +583,7 @@ func trainReinforced() {
 		}
 		wg.Wait()
 
-		// Apply training on master NNs for benchmark games
-		applyTraining(masters, results3)
+		// Benchmark is evaluation-only — do NOT train on random players' moves
 		// Accumulate benchmark wins using the shuffled ordering
 		for _, result := range results3 {
 			for k := 0; k < 4; k++ {
