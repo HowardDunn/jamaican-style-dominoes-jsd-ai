@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
+	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"runtime"
@@ -239,9 +242,55 @@ func trainHuman() {
 }
 
 type modelMeta struct {
-	Iterations int `json:"iterations"`
-	TotalWins  int `json:"total_wins"`
-	TotalWins2 int `json:"total_wins_shuffled"`
+	Iterations int     `json:"iterations"`
+	TotalWins  int     `json:"total_wins"`
+	TotalWins2 int     `json:"total_wins_shuffled"`
+	Elo        float64 `json:"elo"`
+}
+
+const eloK = 32.0
+const eloRandomPlayer = 1000.0
+
+// updateEloBench calculates a new Elo rating for a model after benchmark games
+// against 3 random players (each at eloRandomPlayer).
+func updateEloBench(currentElo float64, wins, totalGames int) float64 {
+	if totalGames == 0 {
+		return currentElo
+	}
+	expected := 1.0 / (1.0 + math.Pow(10, (eloRandomPlayer-currentElo)/400.0))
+	actual := float64(wins) / float64(totalGames)
+	// Scale K by number of games for smoother updates
+	return currentElo + eloK*float64(totalGames)/4.0*(actual-expected)
+}
+
+// updateEloMultiplayer updates Elo ratings for a 4-player game.
+// Each player's expected score is the average of pairwise expected scores vs the other 3.
+// playerWins contains the round wins per position, ratings contains current Elos per position.
+func updateEloMultiplayer(ratings [4]float64, playerWins [4]int) [4]float64 {
+	totalWins := 0
+	for _, w := range playerWins {
+		totalWins += w
+	}
+	if totalWins == 0 {
+		return ratings
+	}
+
+	newRatings := ratings
+	for i := 0; i < 4; i++ {
+		// Expected score: average of pairwise expected scores vs each opponent
+		expectedSum := 0.0
+		for j := 0; j < 4; j++ {
+			if i == j {
+				continue
+			}
+			expectedSum += 1.0 / (1.0 + math.Pow(10, (ratings[j]-ratings[i])/400.0))
+		}
+		expected := expectedSum / 3.0 // average pairwise expected score
+
+		actual := float64(playerWins[i]) / float64(totalWins)
+		newRatings[i] = ratings[i] + eloK*(actual-expected)
+	}
+	return newRatings
 }
 
 func saveModelMeta(path string, meta modelMeta) error {
@@ -451,7 +500,16 @@ func trainReinforced() {
 	jsdai2.TotalWins2 = metas[1].TotalWins2
 	jsdai3.TotalWins2 = metas[2].TotalWins2
 	jsdai4.TotalWins2 = metas[3].TotalWins2
+	elos := [4]float64{}
+	for i := range elos {
+		if metas[i].Elo > 0 {
+			elos[i] = metas[i].Elo
+		} else {
+			elos[i] = eloRandomPlayer // start at random player baseline
+		}
+	}
 	log.Info("Resuming from iteration: ", iterationCount)
+	log.Infof("Starting Elos: [%.1f, %.1f, %.1f, %.1f]", elos[0], elos[1], elos[2], elos[3])
 
 	jsdai1.Epsilon = 0.1
 	jsdai2.Epsilon = 0.1
@@ -536,6 +594,8 @@ func trainReinforced() {
 				masters[k].TotalWins += r.playerWins[k]
 				rollingNN[k][rollingIdx] += r.playerWins[k]
 			}
+			// Update Elo from NN-vs-NN game (fixed order: position k = masters[k])
+			elos = updateEloMultiplayer(elos, r.playerWins)
 		}
 
 		// Phase 2: Shuffled NN players, parallel game simulation
@@ -584,6 +644,12 @@ func trainReinforced() {
 			for k := 0; k < 4; k++ {
 				shuffledMasters[k].TotalWins2 += result.playerWins[k]
 				rollingNN2[sg.order[k]][rollingIdx] += result.playerWins[k]
+			}
+			// Update Elo: remap position wins to master Elo indices
+			shuffledElos := [4]float64{elos[sg.order[0]], elos[sg.order[1]], elos[sg.order[2]], elos[sg.order[3]]}
+			newShuffledElos := updateEloMultiplayer(shuffledElos, result.playerWins)
+			for k := 0; k < 4; k++ {
+				elos[sg.order[k]] = newShuffledElos[k]
 			}
 		}
 
@@ -657,6 +723,11 @@ func trainReinforced() {
 			}
 		}
 
+		// Update Elo ratings based on this iteration's benchmark results
+		for m := 0; m < 4; m++ {
+			elos[m] = updateEloBench(elos[m], rollingBench[m][rollingIdx], rollingBenchGames[m][rollingIdx])
+		}
+
 		// Restore exploration
 		jsdai1.Epsilon = savedEpsilon[0]
 		jsdai2.Epsilon = savedEpsilon[1]
@@ -688,6 +759,24 @@ func trainReinforced() {
 	jsdai4.Search = true
 	jsdai4.SearchNum = 100
 
+	// Open CSV for Elo tracking (append mode)
+	eloCSVPath := "./results/elo_history.csv"
+	eloFileExists := false
+	if _, err := os.Stat(eloCSVPath); err == nil {
+		eloFileExists = true
+	}
+	eloFile, err := os.OpenFile(eloCSVPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.Fatal("Failed to open elo CSV: ", err)
+	}
+	defer eloFile.Close()
+	eloWriter := csv.NewWriter(eloFile)
+	defer eloWriter.Flush()
+	if !eloFileExists {
+		eloWriter.Write([]string{"iteration", modelNames[0], modelNames[1], modelNames[2], modelNames[3]})
+		eloWriter.Flush()
+	}
+
 	randomSeed := time.Now().UnixNano()
 	log.Info("Using random Seed: ", randomSeed)
 	rand.Seed(randomSeed)
@@ -715,10 +804,19 @@ func trainReinforced() {
 			if rollingGames > 0 {
 				rollingRate = float64(rollingWins) / float64(rollingGames)
 			}
-			log.Infof("Bench %s: total=%.4f (%d/%d)  rolling1k=%.4f (%d/%d)",
+			log.Infof("Bench %s: total=%.4f (%d/%d)  rolling1k=%.4f (%d/%d)  elo=%.1f",
 				modelNames[m], rate, totalRoundWins[m], totalBenchGames[m],
-				rollingRate, rollingWins, rollingGames)
+				rollingRate, rollingWins, rollingGames, elos[m])
 		}
+		// Write Elo to CSV
+		eloWriter.Write([]string{
+			fmt.Sprintf("%d", iterationCount),
+			fmt.Sprintf("%.1f", elos[0]),
+			fmt.Sprintf("%.1f", elos[1]),
+			fmt.Sprintf("%.1f", elos[2]),
+			fmt.Sprintf("%.1f", elos[3]),
+		})
+		eloWriter.Flush()
 		log.Info("NN Wins: ", []int{jsdai1.TotalWins, jsdai2.TotalWins, jsdai3.TotalWins, jsdai4.TotalWins})
 		log.Info("NN Wins2: ", []int{jsdai1.TotalWins2, jsdai2.TotalWins2, jsdai3.TotalWins2, jsdai4.TotalWins2})
 		n1 := float64(jsdai1.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
@@ -748,6 +846,7 @@ func trainReinforced() {
 			Iterations: iterationCount,
 			TotalWins:  masters[i].TotalWins,
 			TotalWins2: masters[i].TotalWins2,
+			Elo:        elos[i],
 		})
 	}
 	log.Info("Took : ", time.Now().Sub(start))
