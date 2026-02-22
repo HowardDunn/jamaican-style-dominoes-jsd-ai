@@ -249,47 +249,44 @@ type modelMeta struct {
 }
 
 const eloK = 32.0
+const eloMaxRoundWins = 6.0
 const eloRandomPlayer = 1000.0
 
-// updateEloBench calculates a new Elo rating for a model after benchmark games
-// against 3 random players (each at eloRandomPlayer).
-func updateEloBench(currentElo float64, wins, totalGames int) float64 {
-	if totalGames == 0 {
-		return currentElo
+// updateEloBench calculates a new Elo rating for a model after a benchmark game
+// against 3 random players (each at eloRandomPlayer). Matches backend logic.
+func updateEloBench(currentElo float64, roundWins int) float64 {
+	playerScore := float64(roundWins) / eloMaxRoundWins
+	if roundWins >= 6 {
+		playerScore = 1.0
 	}
-	expected := 1.0 / (1.0 + math.Pow(10, (eloRandomPlayer-currentElo)/400.0))
-	actual := float64(wins) / float64(totalGames)
-	return currentElo + eloK*(actual-expected)
+	// Sum pairwise expected scores vs 3 random opponents
+	probabilityTotal := 0.0
+	for j := 0; j < 3; j++ {
+		probabilityTotal += 1.0 / (1.0 + math.Pow(10, (eloRandomPlayer-currentElo)/400.0))
+	}
+	expected := probabilityTotal / eloMaxRoundWins
+	return currentElo + eloK*(playerScore-expected)
 }
 
-// updateEloMultiplayer updates Elo ratings for a 4-player game.
-// Each player's expected score is the average of pairwise expected scores vs the other 3.
-// playerWins contains the round wins per position, ratings contains current Elos per position.
-func updateEloMultiplayer(ratings [4]float64, playerWins [4]int, numGames int) [4]float64 {
-	totalWins := 0
-	for _, w := range playerWins {
-		totalWins += w
-	}
-	if totalWins == 0 {
-		return ratings
-	}
-
+// updateEloMultiplayer updates Elo ratings for a 4-player cutthroat game.
+// Matches the backend logic: score = roundWins/6, expected = sum of pairwise probs / 6.
+func updateEloMultiplayer(ratings [4]float64, playerWins [4]int) [4]float64 {
 	newRatings := ratings
-	// Scale K down by number of games since this is called per-game
-	k := eloK / float64(numGames)
 	for i := 0; i < 4; i++ {
-		// Expected score: average of pairwise expected scores vs each opponent
-		expectedSum := 0.0
+		playerScore := float64(playerWins[i]) / eloMaxRoundWins
+		if playerWins[i] >= 6 {
+			playerScore = 1.0
+		}
+		// Sum pairwise expected scores vs each opponent
+		probabilityTotal := 0.0
 		for j := 0; j < 4; j++ {
 			if i == j {
 				continue
 			}
-			expectedSum += 1.0 / (1.0 + math.Pow(10, (ratings[j]-ratings[i])/400.0))
+			probabilityTotal += 1.0 / (1.0 + math.Pow(10, (ratings[j]-ratings[i])/400.0))
 		}
-		expected := expectedSum / 3.0 // average pairwise expected score
-
-		actual := float64(playerWins[i]) / float64(totalWins)
-		newRatings[i] = ratings[i] + k*(actual-expected)
+		expected := probabilityTotal / eloMaxRoundWins
+		newRatings[i] = ratings[i] + eloK*(playerScore-expected)
 	}
 	return newRatings
 }
@@ -596,7 +593,7 @@ func trainReinforced() {
 				rollingNN[k][rollingIdx] += r.playerWins[k]
 			}
 			// Update Elo from NN-vs-NN game (fixed order: position k = masters[k])
-			elos = updateEloMultiplayer(elos, r.playerWins, sameGameIterations)
+			elos = updateEloMultiplayer(elos, r.playerWins)
 		}
 
 		// Phase 2: Shuffled NN players, parallel game simulation
@@ -648,7 +645,7 @@ func trainReinforced() {
 			}
 			// Update Elo: remap position wins to master Elo indices
 			shuffledElos := [4]float64{elos[sg.order[0]], elos[sg.order[1]], elos[sg.order[2]], elos[sg.order[3]]}
-			newShuffledElos := updateEloMultiplayer(shuffledElos, result.playerWins, sameGameIterations)
+			newShuffledElos := updateEloMultiplayer(shuffledElos, result.playerWins)
 			for k := 0; k < 4; k++ {
 				elos[sg.order[k]] = newShuffledElos[k]
 			}
@@ -714,19 +711,16 @@ func trainReinforced() {
 		}
 		wg.Wait()
 
-		// Accumulate per-model benchmark wins and total games
+		// Accumulate per-model benchmark wins and update Elo per game
 		for m := 0; m < 4; m++ {
 			for g := 0; g < 2; g++ {
 				totalRoundWins[m] += benchOut[m*2+g].nnWins
 				totalBenchGames[m] += benchOut[m*2+g].totalWins
 				rollingBench[m][rollingIdx] += benchOut[m*2+g].nnWins
 				rollingBenchGames[m][rollingIdx] += benchOut[m*2+g].totalWins
+				// Update Elo once per benchmark game (matches backend logic)
+				elos[m] = updateEloBench(elos[m], benchOut[m*2+g].nnWins)
 			}
-		}
-
-		// Update Elo ratings based on this iteration's benchmark results
-		for m := 0; m < 4; m++ {
-			elos[m] = updateEloBench(elos[m], rollingBench[m][rollingIdx], rollingBenchGames[m][rollingIdx])
 		}
 
 		// Restore exploration
