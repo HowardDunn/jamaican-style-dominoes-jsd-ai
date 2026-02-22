@@ -72,7 +72,7 @@ func trainHuman() {
 	filterUsers := true
 	epochs := 5
 
-	jsdai := nn.New(126, []int{56, 56}, 56)
+	jsdai := nn.New(126, []int{204, 102}, 56)
 	r := make([]float64, 96)
 	nn.FillRandom(r, float64(len(r)))
 
@@ -241,15 +241,27 @@ func trainReinforced() {
 	start := time.Now()
 
 	sameGameIterations := 8
+	maxGames := 100
 	totalRoundWins := [4]int{}
 	jsdai1 := nn.New(126, []int{150}, 56)
 	jsdai2 := nn.New(126, []int{64, 64}, 56)
 	jsdai3 := nn.New(126, []int{32, 32}, 56)
 	jsdai4 := nn.New(126, []int{128, 128}, 56)
+	jsdai1.OutputActivation = "linear"
+	jsdai2.OutputActivation = "linear"
+	jsdai3.OutputActivation = "linear"
+	jsdai4.OutputActivation = "linear"
+	// NOTE: Do not load models trained with ReLU output when using linear output.
+	// The pre-trained weights assume ReLU clips negatives, so linear will cause
+	// gradient explosion. Start fresh or use OutputActivation = "relu" to resume.
 	jsdai1.Load("./results/" + "jasai1.mdl")
 	jsdai2.Load("./results/" + "jasai2.mdl")
 	jsdai3.Load("./results/" + "jasai3.mdl")
 	jsdai4.Load("./results/" + "jasai4.mdl")
+	jsdai1.Epsilon = 0.1
+	jsdai2.Epsilon = 0.1
+	jsdai3.Epsilon = 0.1
+	jsdai4.Epsilon = 0.1
 
 	reinForceMentLearn := func(r int64) {
 		iter := func(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, totWins [4]*int, rand int64) {
@@ -304,12 +316,6 @@ func trainReinforced() {
 						}
 					}
 					roundGameEvents = []*dominos.GameEvent{}
-				} else if lastGameEvent.EventType == dominos.RoundDraw {
-					roundGameEvents = []*dominos.GameEvent{}
-					jsdai1.ResetPassMemory()
-					jsdai2.ResetPassMemory()
-					jsdai3.ResetPassMemory()
-					jsdai4.ResetPassMemory()
 				}
 
 			}
@@ -325,11 +331,11 @@ func trainReinforced() {
 		}
 
 		for i := 0; i < sameGameIterations; i++ {
-			// TODO: bar
 			nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
 			gp := [4]dominos.Player{nnPlayers[0], nnPlayers[1], nnPlayers[2], nnPlayers[3]}
 			tots := [4]*int{&nnPlayers[0].TotalWins, &nnPlayers[1].TotalWins, &nnPlayers[2].TotalWins, &nnPlayers[3].TotalWins}
-			iter(gp, nnPlayers, tots, r)
+			iterSeed := rand.Int63n(9223372036854775607)
+			iter(gp, nnPlayers, tots, iterSeed)
 		}
 
 		for i := 0; i < sameGameIterations; i++ {
@@ -344,7 +350,13 @@ func trainReinforced() {
 			iter(gp, nnPlayers, tots, randNum)
 		}
 
-		// TODO: bar
+		// Disable exploration for benchmark against random players
+		savedEpsilon := [4]float64{jsdai1.Epsilon, jsdai2.Epsilon, jsdai3.Epsilon, jsdai4.Epsilon}
+		jsdai1.Epsilon = 0
+		jsdai2.Epsilon = 0
+		jsdai3.Epsilon = 0
+		jsdai4.Epsilon = 0
+
 		nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
 		gp := [4]dominos.Player{&dominos.ComputerPlayer{RandomMode: true}, &dominos.ComputerPlayer{RandomMode: true}, nnPlayers[2], &dominos.ComputerPlayer{RandomMode: true}}
 		tots := [4]*int{&totalRoundWins[0], &totalRoundWins[1], &totalRoundWins[2], &totalRoundWins[3]}
@@ -354,8 +366,15 @@ func trainReinforced() {
 		})
 
 		for i := 0; i < sameGameIterations; i++ {
-			iter(gp, nnPlayers, tots, r)
+			benchSeed := rand.Int63n(9223372036854775607)
+			iter(gp, nnPlayers, tots, benchSeed)
 		}
+
+		// Restore exploration
+		jsdai1.Epsilon = savedEpsilon[0]
+		jsdai2.Epsilon = savedEpsilon[1]
+		jsdai3.Epsilon = savedEpsilon[2]
+		jsdai4.Epsilon = savedEpsilon[3]
 	}
 
 	jsdai1.Search = true
@@ -370,7 +389,7 @@ func trainReinforced() {
 	randomSeed := time.Now().UnixNano()
 	log.Info("Using random Seed: ", randomSeed)
 	rand.Seed(randomSeed)
-	for j := 0; j < 5000000; j++ {
+	for j := 0; j < maxGames; j++ {
 		randNum := rand.Int63n(9223372036854775607)
 		reinForceMentLearn(randNum)
 		log.Info("Games Seen: ", j+1)
@@ -429,6 +448,203 @@ func trainReinforced() {
 // 		iter(gp, nnPlayers, tots, r)
 // 	}
 // }
+
+func trainKerasReinforced() {
+	start := time.Now()
+	serverURL := "http://localhost:8777"
+
+	sameGameIterations := 8
+	maxGames := 100
+	totalRoundWins := [4]int{}
+
+	kp1 := nn.NewKerasPlayer(serverURL, "keras1", []int{150})
+	kp2 := nn.NewKerasPlayer(serverURL, "keras2", []int{64, 64})
+	kp3 := nn.NewKerasPlayer(serverURL, "keras3", []int{32, 32})
+	kp4 := nn.NewKerasPlayer(serverURL, "keras4", []int{128, 128})
+
+	// Try loading existing weights (ignore errors if no saved weights yet)
+	kp1.Load("")
+	kp2.Load("")
+	kp3.Load("")
+	kp4.Load("")
+
+	kp1.Epsilon = 0.1
+	kp2.Epsilon = 0.1
+	kp3.Epsilon = 0.1
+	kp4.Epsilon = 0.1
+
+	reinForceMentLearn := func(r int64) {
+		iter := func(dp [4]dominos.Player, kpPlayers [4]*nn.KerasPlayer, totWins [4]*int, rand int64) {
+			dominosGame := dominos.NewLocalGame(dp, int64(rand), "cutthroat")
+			roundGameEvents := []*dominos.GameEvent{}
+			lastGameEvent := &dominos.GameEvent{}
+
+			for lastGameEvent != nil && lastGameEvent.EventType != dominos.GameWin {
+				lastGameEvent = dominosGame.AdvanceGameIteration()
+				lGE := jsdonline.CopyandRotateGameEvent(lastGameEvent, 0)
+
+				if lGE.EventType == dominos.PlayedCard ||
+					lGE.EventType == dominos.Passed || lastGameEvent.EventType == dominos.RoundWin ||
+					lastGameEvent.EventType == dominos.RoundDraw {
+					roundGameEvents = append(roundGameEvents, lGE)
+				}
+
+				if lastGameEvent.EventType == dominos.RoundWin || lastGameEvent.EventType == dominos.RoundDraw {
+					kp1.ResetPassMemory()
+					kp2.ResetPassMemory()
+					kp3.ResetPassMemory()
+					kp4.ResetPassMemory()
+
+					// Collect batches per player, then send one train call each
+					type sample struct {
+						features   []float64
+						target     []float64
+						actionMask [56]float64
+					}
+					playerBatches := [4][]sample{}
+					playerLearnRates := [4]float64{}
+					for p := 0; p < 4; p++ {
+						playerLearnRates[p] = 0.0001
+						if len(kpPlayers[p].GetHiddenDims()) == 1 {
+							playerLearnRates[p] = 0.001
+						}
+					}
+
+					for i, gameEvent := range roundGameEvents {
+						if gameEvent.EventType == dominos.PlayedCard {
+							kp := kpPlayers[gameEvent.Player]
+							rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
+							nextRelevant := [16]*dominos.GameEvent{}
+							for j := 1; j < 17; j++ {
+								if (i + j) >= len(roundGameEvents) {
+									break
+								}
+								nextRelevant[j-1] = jsdonline.CopyandRotateGameEvent(roundGameEvents[i+j], gameEvent.Player)
+							}
+							features, target, actionMask, skip := kp.PrepareTrainSample(rotatedGameEvent, nextRelevant)
+							if !skip {
+								playerBatches[gameEvent.Player] = append(playerBatches[gameEvent.Player], sample{features, target, actionMask})
+							}
+						} else if gameEvent.EventType == dominos.Passed {
+							kp := kpPlayers[gameEvent.Player]
+							kp.UpdatePassMemory(gameEvent)
+						} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
+							kp := kpPlayers[gameEvent.Player]
+							kp.ResetPassMemory()
+						}
+					}
+
+					// Send one batch per player
+					for p := 0; p < 4; p++ {
+						if len(playerBatches[p]) == 0 {
+							continue
+						}
+						fb := make([][]float64, len(playerBatches[p]))
+						tb := make([][]float64, len(playerBatches[p]))
+						mb := make([][56]float64, len(playerBatches[p]))
+						for s := range playerBatches[p] {
+							fb[s] = playerBatches[p][s].features
+							tb[s] = playerBatches[p][s].target
+							mb[s] = playerBatches[p][s].actionMask
+						}
+						_, err := kpPlayers[p].TrainBatch(fb, tb, mb, playerLearnRates[p])
+						if err != nil {
+							log.Fatal("Error training keras batch: ", err)
+						}
+					}
+
+					roundGameEvents = []*dominos.GameEvent{}
+				}
+			}
+			*totWins[0] += lastGameEvent.PlayerWins[0]
+			*totWins[1] += lastGameEvent.PlayerWins[1]
+			*totWins[2] += lastGameEvent.PlayerWins[2]
+			*totWins[3] += lastGameEvent.PlayerWins[3]
+
+			kp1.Save("")
+			kp2.Save("")
+			kp3.Save("")
+			kp4.Save("")
+		}
+
+		for i := 0; i < sameGameIterations; i++ {
+			kpPlayers := [4]*nn.KerasPlayer{kp1, kp2, kp3, kp4}
+			gp := [4]dominos.Player{kpPlayers[0], kpPlayers[1], kpPlayers[2], kpPlayers[3]}
+			tots := [4]*int{&kpPlayers[0].TotalWins, &kpPlayers[1].TotalWins, &kpPlayers[2].TotalWins, &kpPlayers[3].TotalWins}
+			iterSeed := rand.Int63n(9223372036854775607)
+			iter(gp, kpPlayers, tots, iterSeed)
+		}
+
+		for i := 0; i < sameGameIterations; i++ {
+			kpPlayers := [4]*nn.KerasPlayer{kp1, kp2, kp3, kp4}
+			rand.Shuffle(len(kpPlayers), func(i, j int) {
+				kpPlayers[i], kpPlayers[j] = kpPlayers[j], kpPlayers[i]
+			})
+			gp := [4]dominos.Player{kpPlayers[0], kpPlayers[1], kpPlayers[2], kpPlayers[3]}
+			tots := [4]*int{&kpPlayers[0].TotalWins2, &kpPlayers[1].TotalWins2, &kpPlayers[2].TotalWins2, &kpPlayers[3].TotalWins2}
+			randNum := rand.Int63n(9223372036854775607)
+			iter(gp, kpPlayers, tots, randNum)
+		}
+
+		// Benchmark against random players (no exploration)
+		savedEpsilon := [4]float64{kp1.Epsilon, kp2.Epsilon, kp3.Epsilon, kp4.Epsilon}
+		kp1.Epsilon = 0
+		kp2.Epsilon = 0
+		kp3.Epsilon = 0
+		kp4.Epsilon = 0
+
+		kpPlayers := [4]*nn.KerasPlayer{kp1, kp2, kp3, kp4}
+		gp := [4]dominos.Player{&dominos.ComputerPlayer{RandomMode: true}, &dominos.ComputerPlayer{RandomMode: true}, kpPlayers[2], &dominos.ComputerPlayer{RandomMode: true}}
+		tots := [4]*int{&totalRoundWins[0], &totalRoundWins[1], &totalRoundWins[2], &totalRoundWins[3]}
+		rand.Shuffle(len(kpPlayers), func(i, j int) {
+			gp[i], gp[j] = gp[j], gp[i]
+			tots[i], tots[j] = tots[j], tots[i]
+		})
+
+		for i := 0; i < sameGameIterations; i++ {
+			benchSeed := rand.Int63n(9223372036854775607)
+			iter(gp, kpPlayers, tots, benchSeed)
+		}
+
+		kp1.Epsilon = savedEpsilon[0]
+		kp2.Epsilon = savedEpsilon[1]
+		kp3.Epsilon = savedEpsilon[2]
+		kp4.Epsilon = savedEpsilon[3]
+	}
+
+	randomSeed := time.Now().UnixNano()
+	log.Info("Using random Seed: ", randomSeed)
+	rand.Seed(randomSeed)
+	for j := 0; j < maxGames; j++ {
+		randNum := rand.Int63n(9223372036854775607)
+		reinForceMentLearn(randNum)
+		log.Info("Games Seen: ", j+1)
+		log.Info("Total Player Wins 3rd: ", totalRoundWins, " Total Rounds: ", totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		r1 := float64(totalRoundWins[0]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		r2 := float64(totalRoundWins[1]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		r3 := float64(totalRoundWins[2]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		r4 := float64(totalRoundWins[3]) / float64(totalRoundWins[0]+totalRoundWins[1]+totalRoundWins[2]+totalRoundWins[3])
+		log.Info("Player Ratios: ", []float64{r1, r2, r3, r4})
+		log.Info("Keras NN Wins: ", []int{kp1.TotalWins, kp2.TotalWins, kp3.TotalWins, kp4.TotalWins})
+		log.Info("Keras NN Wins2: ", []int{kp1.TotalWins2, kp2.TotalWins2, kp3.TotalWins2, kp4.TotalWins2})
+		n1 := float64(kp1.TotalWins) / float64(kp1.TotalWins+kp2.TotalWins+kp3.TotalWins+kp4.TotalWins)
+		n2 := float64(kp2.TotalWins) / float64(kp1.TotalWins+kp2.TotalWins+kp3.TotalWins+kp4.TotalWins)
+		n3 := float64(kp3.TotalWins) / float64(kp1.TotalWins+kp2.TotalWins+kp3.TotalWins+kp4.TotalWins)
+		n4 := float64(kp4.TotalWins) / float64(kp1.TotalWins+kp2.TotalWins+kp3.TotalWins+kp4.TotalWins)
+		log.Info("Keras NN Ratios: ", []float64{n1, n2, n3, n4})
+		n21 := float64(kp1.TotalWins2) / float64(kp1.TotalWins2+kp2.TotalWins2+kp3.TotalWins2+kp4.TotalWins2)
+		n22 := float64(kp2.TotalWins2) / float64(kp1.TotalWins2+kp2.TotalWins2+kp3.TotalWins2+kp4.TotalWins2)
+		n23 := float64(kp3.TotalWins2) / float64(kp1.TotalWins2+kp2.TotalWins2+kp3.TotalWins2+kp4.TotalWins2)
+		n24 := float64(kp4.TotalWins2) / float64(kp1.TotalWins2+kp2.TotalWins2+kp3.TotalWins2+kp4.TotalWins2)
+		log.Info("Keras NN Ratios2: ", []float64{n21, n22, n23, n24})
+	}
+
+	kp1.Save("")
+	kp2.Save("")
+	kp3.Save("")
+	kp4.Save("")
+	log.Info("Took : ", time.Now().Sub(start))
+}
 
 func duppyPlay() {
 	token, err := duppy.UserLogin("duppy", "@ecIN)A*$Y93UhZ*")
@@ -495,7 +711,8 @@ func duppyPlay() {
 
 func main() {
 	// trainReinforced()
-	trainHuman()
+	trainKerasReinforced()
+	// trainHuman()
 	// 69 / 333, 80/367, 194,997. 205,1085
 	// duppyPlay()
 }

@@ -1,0 +1,5 @@
+tensorflow-macos
+tensorflow-metal
+fastapi
+uvicorn[standard]
+numpy

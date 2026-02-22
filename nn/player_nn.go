@@ -34,8 +34,10 @@ type JSDNN struct {
 	outputDim     int
 	gameType      string
 	knownNotHaves [4]map[uint]bool
-	Search        bool
-	SearchNum     int
+	Search           bool
+	SearchNum        int
+	OutputActivation string  // "relu" or "linear"
+	Epsilon          float64 // epsilon-greedy exploration rate (0.0 = greedy, 0.1 = 10% random)
 }
 
 func fillRandom(a []float64, v float64) {
@@ -102,16 +104,17 @@ func New(input int, hidden []int, output int) *JSDNN {
 	}
 
 	return &JSDNN{
-		hidden:         hiddenT,
-		final:          finalT,
-		bHidden:        bHidden,
-		bFinal:         bFinal,
-		ComputerPlayer: &dominos.ComputerPlayer{},
-		inputDim:       input,
-		hiddenDim:      hidden,
-		outputDim:      output,
-		gameType:       "cutthroat",
-		knownNotHaves:  knownNotHaves,
+		hidden:           hiddenT,
+		final:            finalT,
+		bHidden:          bHidden,
+		bFinal:           bFinal,
+		ComputerPlayer:   &dominos.ComputerPlayer{},
+		inputDim:         input,
+		hiddenDim:        hidden,
+		outputDim:        output,
+		gameType:         "cutthroat",
+		knownNotHaves:    knownNotHaves,
+		OutputActivation: "relu",
 	}
 }
 
@@ -143,6 +146,16 @@ func sigmoid(x float64) float64 {
 // of the sigmoid function for backpropagation.
 func sigmoidPrime(x float64) float64 {
 	return x * (1.0 - x)
+}
+
+func clipValue(x float64) float64 {
+	if x > 1.0 {
+		return 1.0
+	}
+	if x < -1.0 {
+		return -1.0
+	}
+	return x
 }
 
 func sum(x []float64) float64 {
@@ -191,7 +204,7 @@ func (j *JSDNN) ResetPassMemory() {
 	}
 	for i := 0; i < len(j.knownNotHaves); i++ {
 		for k := 0; k < 28; k++ {
-			j.knownNotHaves[i][uint(i)] = false
+			j.knownNotHaves[i][uint(k)] = false
 		}
 	}
 }
@@ -364,9 +377,9 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 		wonByBlock = false
 	}
 	if hasHardEnd && !won {
-		reward = -15.0
+		reward = -5.0
 	} else if isDouble && !won {
-		reward = 15.0
+		reward = reward + 3.0
 	}
 	if wonByBlock {
 		reward = reward * 1.5
@@ -464,18 +477,22 @@ func (j *JSDNN) predict(a tensor.Tensor) (tensor.Tensor, error) {
 		return nil, err
 	}
 
-	prediction, err := final.Apply(relu, tensor.UseSafe())
-	if err != nil {
-		return nil, err
+	if j.OutputActivation != "linear" {
+		prediction, err := final.Apply(relu, tensor.UseSafe())
+		if err != nil {
+			return nil, err
+		}
+		return prediction, nil
 	}
 
-	return prediction, nil
+	return final, nil
 }
 
 func (j *JSDNN) Clone() *JSDNN {
 	clone := New(j.inputDim, j.hiddenDim, j.outputDim)
 	clone.final = j.final.Clone().(*tensor.Dense)
 	clone.bFinal = j.bFinal.Clone().(*tensor.Dense)
+	clone.OutputActivation = j.OutputActivation
 
 	for i := range clone.hidden {
 		clone.hidden[i] = j.hidden[i].Clone().(*tensor.Dense)
@@ -726,7 +743,7 @@ func (j *JSDNN) getLearnRate(learnRates []float64, layerIndex int) float64 {
 	return learnRates[len(learnRates)-1]
 }
 
-func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRates []float64) (float64, error) {
+func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRates []float64, mask tensor.Tensor) (float64, error) {
 	err := x.Reshape(x.Shape()[0], 1)
 	if err != nil {
 		log.Fatal(err, " ", "x")
@@ -805,10 +822,16 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 		return 0.0, err
 	}
 
-	pred, err := final.Apply(relu, tensor.UseSafe())
-	if err != nil {
-		log.Fatal(err, " ", "4")
-		return 0.0, err
+	var pred *tensor.Dense
+	if j.OutputActivation != "linear" {
+		predT, applyErr := final.Apply(relu, tensor.UseSafe())
+		if applyErr != nil {
+			log.Fatal(applyErr, " ", "4")
+			return 0.0, applyErr
+		}
+		pred = predT.(*tensor.Dense)
+	} else {
+		pred = final.Clone().(*tensor.Dense)
 	}
 
 	err = pred.Reshape(pred.Shape()[0], 1)
@@ -825,11 +848,43 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 		return 0.0, err
 	}
 
-	// Calculate the derivative of the output activation with respect to the hidden activaton layer
-	dpred, err := pred.Apply(reluPrime, tensor.UseUnsafe())
+	// Apply mask to only update the taken action's error (if mask provided)
+	if mask != nil {
+		err = mask.Reshape(mask.Shape()[0], 1)
+		if err != nil {
+			log.Fatal(err, " ", "mask reshape")
+			return 0.0, err
+		}
+		_, err = tensor.Mul(outputErrors, mask, tensor.UseUnsafe())
+		if err != nil {
+			log.Fatal(err, " ", "mask mul")
+			return 0.0, err
+		}
+	}
+
+	// Clip gradients to prevent explosion
+	_, err = outputErrors.Apply(clipValue, tensor.UseUnsafe())
 	if err != nil {
-		log.Fatal(err, " ", "6")
+		log.Fatal(err, " ", "clip")
 		return 0.0, err
+	}
+
+	// Calculate the derivative of the output activation with respect to the hidden activaton layer
+	var dpred *tensor.Dense
+	if j.OutputActivation != "linear" {
+		dpredT, applyErr := pred.Apply(reluPrime, tensor.UseUnsafe())
+		if applyErr != nil {
+			log.Fatal(applyErr, " ", "6")
+			return 0.0, applyErr
+		}
+		dpred = dpredT.(*tensor.Dense)
+	} else {
+		// Linear activation: derivative is 1.0 everywhere
+		ones := make([]float64, pred.Shape()[0])
+		for i := range ones {
+			ones[i] = 1.0
+		}
+		dpred = tensor.New(tensor.WithShape(pred.Shape()...), tensor.WithBacking(ones))
 	}
 
 	j.final.T()
@@ -1035,7 +1090,7 @@ func (j *JSDNN) Train(gameEvent *dominos.GameEvent, learnRates []float64) (float
 	}
 	y := j.ConvertCardChoiceToTensor(gameEvent)
 
-	return j.train(x, y, gameEvent, learnRates)
+	return j.train(x, y, gameEvent, learnRates, nil)
 }
 
 func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRates []float64, nextGameEvents [16]*dominos.GameEvent) (float64, error) {
@@ -1049,19 +1104,16 @@ func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRates []float
 	}
 	y := j.ConvertCardChoiceToTensorReinforced(gameEvent, nextGameEvents)
 
-	err := x.Reshape(x.Shape()[0], 1)
-	if err != nil {
-		log.Fatal(err, " ", "x")
-		return 0.0, err
+	// Build a mask: 1.0 only at the index of the action taken, 0.0 elsewhere
+	actionMask := [56]float64{}
+	actionIndex := gameEvent.Card
+	if gameEvent.Side == dominos.Right {
+		actionIndex = actionIndex + 28
 	}
+	actionMask[actionIndex] = 1.0
+	mask := tensor.New(tensor.WithShape(56), tensor.WithBacking(actionMask[:]))
 
-	err = y.Reshape(y.Shape()[0], 1)
-	if err != nil {
-		log.Fatal(err, " ", "y")
-		return 0.0, err
-	}
-
-	return j.train(x, y, gameEvent, learnRates)
+	return j.train(x, y, gameEvent, learnRates, mask)
 }
 
 func (j *JSDNN) Save(fileName string) error {
@@ -1186,6 +1238,29 @@ func (j *JSDNN) PoseCard(doms []dominos.Domino) uint {
 
 func (j *JSDNN) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (uint, dominos.BoardSide) {
 	gameEvent = jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
+
+	// Epsilon-greedy exploration: pick a random compatible card
+	if j.Epsilon > 0 && rand.Float64() < j.Epsilon {
+		compatibleCards := []dominos.CardChoice{}
+		for _, card := range gameEvent.PlayerHands[gameEvent.Player] {
+			if card >= 28 {
+				continue
+			}
+			suit1, suit2 := doms[card].GetSuits()
+			if gameEvent.BoardState.CardPosed {
+				if suit1 == gameEvent.BoardState.LeftSuit || suit2 == gameEvent.BoardState.LeftSuit {
+					compatibleCards = append(compatibleCards, dominos.CardChoice{Card: card, Side: dominos.Left})
+				}
+				if suit1 == gameEvent.BoardState.RightSuit || suit2 == gameEvent.BoardState.RightSuit {
+					compatibleCards = append(compatibleCards, dominos.CardChoice{Card: card, Side: dominos.Right})
+				}
+			}
+		}
+		if len(compatibleCards) > 0 {
+			pick := compatibleCards[rand.Intn(len(compatibleCards))]
+			return pick.Card, pick.Side
+		}
+	}
 
 	cardChoice, err := j.Predict(gameEvent)
 	if err != nil || cardChoice.Card > 27 {

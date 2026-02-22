@@ -259,7 +259,7 @@ func TestMNISTSingleHiddenLayer(t *testing.T) {
 			yData[trainLabels[idx]] = 1.0
 			y := tensor.New(tensor.WithShape(10), tensor.WithBacking(yData))
 
-			cost, err := net.train(x, y, nil, []float64{learnRate})
+			cost, err := net.train(x, y, nil, []float64{learnRate}, nil)
 			if err != nil {
 				t.Fatalf("training error: %v", err)
 			}
@@ -314,7 +314,7 @@ func TestMNISTMultiHiddenLayer(t *testing.T) {
 			yData[trainLabels[idx]] = 1.0
 			y := tensor.New(tensor.WithShape(10), tensor.WithBacking(yData))
 
-			cost, err := net.train(x, y, nil, currentRates)
+			cost, err := net.train(x, y, nil, currentRates, nil)
 			if err != nil {
 				t.Fatalf("training error: %v", err)
 			}
@@ -361,7 +361,7 @@ func TestGradientFlow(t *testing.T) {
 		copy(yCopy, yData)
 		x := tensor.New(tensor.WithShape(4), tensor.WithBacking(xCopy))
 		y := tensor.New(tensor.WithShape(3), tensor.WithBacking(yCopy))
-		_, err := net.train(x, y, nil, []float64{0.01})
+		_, err := net.train(x, y, nil, []float64{0.01}, nil)
 		if err != nil {
 			t.Fatalf("training error: %v", err)
 		}
@@ -435,7 +435,7 @@ func TestPerLayerLearningRates(t *testing.T) {
 		x := tensor.New(tensor.WithShape(4), tensor.WithBacking(xCopy))
 		y := tensor.New(tensor.WithShape(3), tensor.WithBacking(yCopy))
 		// learnRates: [hidden0=0.0, hidden1=0.01, final=0.01]
-		_, err := net.train(x, y, nil, []float64{0.0, 0.01, 0.01})
+		_, err := net.train(x, y, nil, []float64{0.0, 0.01, 0.01}, nil)
 		if err != nil {
 			t.Fatalf("training error: %v", err)
 		}
@@ -489,7 +489,7 @@ func TestMNISTPerLayerLR(t *testing.T) {
 			yData[trainLabels[idx]] = 1.0
 			y := tensor.New(tensor.WithShape(10), tensor.WithBacking(yData))
 
-			cost, err := net.train(x, y, nil, perLayerRates)
+			cost, err := net.train(x, y, nil, perLayerRates, nil)
 			if err != nil {
 				t.Fatalf("training error: %v", err)
 			}
