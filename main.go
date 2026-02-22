@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"math/rand"
 	"os"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/HowardDunn/go-dominos/dominos"
@@ -236,12 +238,183 @@ func trainHuman() {
 	jsdai.Save(path + "model.mdl")
 }
 
+type modelMeta struct {
+	Iterations int `json:"iterations"`
+	TotalWins  int `json:"total_wins"`
+	TotalWins2 int `json:"total_wins_shuffled"`
+}
+
+func saveModelMeta(path string, meta modelMeta) error {
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func loadModelMeta(path string) modelMeta {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return modelMeta{}
+	}
+	var meta modelMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return modelMeta{}
+	}
+	return meta
+}
+
+type roundEvent struct {
+	eventType  string // "train", "pass", or "reset"
+	player     int
+	gameEvent  *dominos.GameEvent
+	nextEvents [16]*dominos.GameEvent // only used for "train"
+}
+
+type gameResult struct {
+	rounds     [][]roundEvent
+	playerWins [4]int
+}
+
+// cloneNNs creates deep copies of the master NNs for concurrent gameplay.
+// Copies Epsilon, Search, and SearchNum so clones behave identically during play.
+func cloneNNs(masters [4]*nn.JSDNN) [4]*nn.JSDNN {
+	var clones [4]*nn.JSDNN
+	for i, m := range masters {
+		clones[i] = m.Clone()
+		clones[i].Epsilon = m.Epsilon
+		clones[i].Search = m.Search
+		clones[i].SearchNum = m.SearchNum
+	}
+	return clones
+}
+
+// playGame runs a full domino game using the provided players and NN references.
+// It collects round events without training. The nnPlayers are used to determine
+// which player index maps to which NN for event collection.
+func playGame(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, seed int64) gameResult {
+	dominosGame := dominos.NewLocalGame(dp, seed, "cutthroat")
+	roundGameEvents := []*dominos.GameEvent{}
+	lastGameEvent := &dominos.GameEvent{}
+	result := gameResult{}
+
+	for lastGameEvent != nil && lastGameEvent.EventType != dominos.GameWin {
+		lastGameEvent = dominosGame.AdvanceGameIteration()
+		lGE := jsdonline.CopyandRotateGameEvent(lastGameEvent, 0)
+
+		if lGE.EventType == dominos.PlayedCard ||
+			lGE.EventType == dominos.Passed || lastGameEvent.EventType == dominos.RoundWin ||
+			lastGameEvent.EventType == dominos.RoundDraw {
+			roundGameEvents = append(roundGameEvents, lGE)
+		}
+
+		if lastGameEvent.EventType == dominos.RoundWin || lastGameEvent.EventType == dominos.RoundDraw {
+			// Reset pass memory on the cloned NNs used for gameplay
+			for k := 0; k < 4; k++ {
+				nnPlayers[k].ResetPassMemory()
+			}
+
+			var round []roundEvent
+			for i, gameEvent := range roundGameEvents {
+				if gameEvent.EventType == dominos.PlayedCard {
+					rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
+					nextRelevant := [16]*dominos.GameEvent{}
+					for j := 1; j < 17; j++ {
+						if (i + j) >= len(roundGameEvents) {
+							break
+						}
+						nextRelevant[j-1] = jsdonline.CopyandRotateGameEvent(roundGameEvents[i+j], gameEvent.Player)
+					}
+					round = append(round, roundEvent{
+						eventType:  "train",
+						player:     gameEvent.Player,
+						gameEvent:  rotatedGameEvent,
+						nextEvents: nextRelevant,
+					})
+				} else if gameEvent.EventType == dominos.Passed {
+					round = append(round, roundEvent{
+						eventType: "pass",
+						player:    gameEvent.Player,
+						gameEvent: gameEvent,
+					})
+				} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
+					round = append(round, roundEvent{
+						eventType: "reset",
+						player:    gameEvent.Player,
+						gameEvent: gameEvent,
+					})
+				}
+			}
+			result.rounds = append(result.rounds, round)
+			roundGameEvents = []*dominos.GameEvent{}
+		}
+	}
+
+	result.playerWins = lastGameEvent.PlayerWins
+	return result
+}
+
+// applyTraining processes collected game results on the master NNs.
+// Each NN only processes its own player's events, so all 4 NNs train in parallel.
+// nnPlayers maps position index to master NN for training.
+func applyTraining(nnPlayers [4]*nn.JSDNN, results []gameResult) {
+	// Build per-player event sequences across all games/rounds.
+	// Each NN's events are independent: pass memory and training only depend
+	// on that player's own prior events, not other players' state.
+	playerEvents := [4][]roundEvent{}
+
+	for _, result := range results {
+		for _, round := range result.rounds {
+			// At round start, all NNs reset pass memory
+			for p := 0; p < 4; p++ {
+				playerEvents[p] = append(playerEvents[p], roundEvent{eventType: "reset"})
+			}
+			// Distribute events to their player's NN
+			for _, evt := range round {
+				playerEvents[evt.player] = append(playerEvents[evt.player], evt)
+			}
+		}
+	}
+
+	// Train each NN in parallel
+	var wg sync.WaitGroup
+	for p := 0; p < 4; p++ {
+		if len(playerEvents[p]) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(playerIdx int) {
+			defer wg.Done()
+			jsdai := nnPlayers[playerIdx]
+			for _, evt := range playerEvents[playerIdx] {
+				switch evt.eventType {
+				case "train":
+					learnRate := 0.0001
+					if jsdai.GetNumHidden() == 1 {
+						learnRate = 0.001
+					}
+					_, err := jsdai.TrainReinforced(evt.gameEvent, []float64{learnRate}, evt.nextEvents)
+					if err != nil {
+						log.Fatal("Error training: ", err)
+					}
+				case "pass":
+					jsdai.UpdatePassMemory(evt.gameEvent)
+				case "reset":
+					jsdai.ResetPassMemory()
+				}
+			}
+		}(p)
+	}
+	wg.Wait()
+}
+
 func trainReinforced() {
 	// Train Reinforcement
 	start := time.Now()
 
 	sameGameIterations := 8
 	maxGames := 100
+	numWorkers := runtime.NumCPU()
 	totalRoundWins := [4]int{}
 	jsdai1 := nn.New(126, []int{150}, 56)
 	jsdai2 := nn.New(126, []int{64, 64}, 56)
@@ -258,116 +431,162 @@ func trainReinforced() {
 	jsdai2.Load("./results/" + "jasai2.mdl")
 	jsdai3.Load("./results/" + "jasai3.mdl")
 	jsdai4.Load("./results/" + "jasai4.mdl")
+
+	// Load metadata to resume iteration counts and win totals
+	modelNames := [4]string{"jasai1", "jasai2", "jasai3", "jasai4"}
+	metas := [4]modelMeta{}
+	for i, name := range modelNames {
+		metas[i] = loadModelMeta("./results/" + name + ".meta.json")
+	}
+	iterationCount := metas[0].Iterations
+	jsdai1.TotalWins = metas[0].TotalWins
+	jsdai2.TotalWins = metas[1].TotalWins
+	jsdai3.TotalWins = metas[2].TotalWins
+	jsdai4.TotalWins = metas[3].TotalWins
+	jsdai1.TotalWins2 = metas[0].TotalWins2
+	jsdai2.TotalWins2 = metas[1].TotalWins2
+	jsdai3.TotalWins2 = metas[2].TotalWins2
+	jsdai4.TotalWins2 = metas[3].TotalWins2
+	log.Info("Resuming from iteration: ", iterationCount)
+
 	jsdai1.Epsilon = 0.1
 	jsdai2.Epsilon = 0.1
 	jsdai3.Epsilon = 0.1
 	jsdai4.Epsilon = 0.1
 
+	masters := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
+
 	reinForceMentLearn := func(r int64) {
-		iter := func(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, totWins [4]*int, rand int64) {
-			dominosGame := dominos.NewLocalGame(dp, int64(rand), "cutthroat")
-			roundGameEvents := []*dominos.GameEvent{}
-			lastGameEvent := &dominos.GameEvent{}
+		// Phase 1: Fixed-order NN players, parallel game simulation
+		seeds := make([]int64, sameGameIterations)
+		for i := range seeds {
+			seeds[i] = rand.Int63n(9223372036854775607)
+		}
 
-			for lastGameEvent != nil && lastGameEvent.EventType != dominos.GameWin {
-				lastGameEvent = dominosGame.AdvanceGameIteration()
-				// log.Infof("LastGame Event: %+#v", lastGameEvent)
-				lGE := jsdonline.CopyandRotateGameEvent(lastGameEvent, 0)
+		results := make([]gameResult, sameGameIterations)
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, numWorkers)
 
-				if lGE.EventType == dominos.PlayedCard ||
-					lGE.EventType == dominos.Passed || lastGameEvent.EventType == dominos.RoundWin ||
-					lastGameEvent.EventType == dominos.RoundDraw {
-					roundGameEvents = append(roundGameEvents, lGE)
-				}
+		for i := 0; i < sameGameIterations; i++ {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(idx int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				clones := cloneNNs(masters)
+				gp := [4]dominos.Player{clones[0], clones[1], clones[2], clones[3]}
+				results[idx] = playGame(gp, clones, seeds[idx])
+			}(i)
+		}
+		wg.Wait()
 
-				if lastGameEvent.EventType == dominos.RoundWin || lastGameEvent.EventType == dominos.RoundDraw {
-					jsdai1.ResetPassMemory()
-					jsdai2.ResetPassMemory()
-					jsdai3.ResetPassMemory()
-					jsdai4.ResetPassMemory()
-					for i, gameEvent := range roundGameEvents {
-						if gameEvent.EventType == dominos.PlayedCard {
-
-							jsdai := nnPlayers[gameEvent.Player]
-							rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
-							// Get the next 4 relevant events
-							nextRelevant := [16]*dominos.GameEvent{}
-							for j := 1; j < 17; j++ {
-								if (i + j) >= len(roundGameEvents) {
-									break
-								}
-								nextRelevant[j-1] = jsdonline.CopyandRotateGameEvent(roundGameEvents[i+j], gameEvent.Player)
-							}
-							learnRate := 0.0001
-							if jsdai.GetNumHidden() == 1 {
-								learnRate = 0.001
-							}
-							_, err := jsdai.TrainReinforced(rotatedGameEvent, []float64{learnRate}, nextRelevant)
-							if err != nil {
-								log.Fatal("Error training: ", err)
-							}
-
-						} else if gameEvent.EventType == dominos.Passed {
-							jsdai := nnPlayers[gameEvent.Player]
-							jsdai.UpdatePassMemory(gameEvent)
-						} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
-							jsdai := nnPlayers[gameEvent.Player]
-							jsdai.ResetPassMemory()
-						}
-					}
-					roundGameEvents = []*dominos.GameEvent{}
-				}
-
+		// Apply training sequentially on master NNs
+		applyTraining(masters, results)
+		// Accumulate wins
+		for _, r := range results {
+			for k := 0; k < 4; k++ {
+				masters[k].TotalWins += r.playerWins[k]
 			}
-			*totWins[0] += lastGameEvent.PlayerWins[0]
-			*totWins[1] += lastGameEvent.PlayerWins[1]
-			*totWins[2] += lastGameEvent.PlayerWins[2]
-			*totWins[3] += lastGameEvent.PlayerWins[3]
-
-			jsdai1.Save("./results/" + "jasai1.mdl")
-			jsdai2.Save("./results/" + "jasai2.mdl")
-			jsdai3.Save("./results/" + "jasai3.mdl")
-			jsdai4.Save("./results/" + "jasai4.mdl")
 		}
 
+		// Phase 2: Shuffled NN players, parallel game simulation
+		// Pre-generate shuffled orderings and seeds on the main goroutine
+		type shuffledGame struct {
+			order [4]int
+			seed  int64
+		}
+		shuffledGames := make([]shuffledGame, sameGameIterations)
+		for i := range shuffledGames {
+			order := [4]int{0, 1, 2, 3}
+			rand.Shuffle(4, func(a, b int) { order[a], order[b] = order[b], order[a] })
+			shuffledGames[i] = shuffledGame{
+				order: order,
+				seed:  rand.Int63n(9223372036854775607),
+			}
+		}
+
+		results2 := make([]gameResult, sameGameIterations)
+		// Store the player ordering so we can map wins back to correct master NNs
 		for i := 0; i < sameGameIterations; i++ {
-			nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
-			gp := [4]dominos.Player{nnPlayers[0], nnPlayers[1], nnPlayers[2], nnPlayers[3]}
-			tots := [4]*int{&nnPlayers[0].TotalWins, &nnPlayers[1].TotalWins, &nnPlayers[2].TotalWins, &nnPlayers[3].TotalWins}
-			iterSeed := rand.Int63n(9223372036854775607)
-			iter(gp, nnPlayers, tots, iterSeed)
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(idx int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				sg := shuffledGames[idx]
+				clones := cloneNNs(masters)
+				// Shuffle clones to match the pre-generated order
+				shuffled := [4]*nn.JSDNN{clones[sg.order[0]], clones[sg.order[1]], clones[sg.order[2]], clones[sg.order[3]]}
+				gp := [4]dominos.Player{shuffled[0], shuffled[1], shuffled[2], shuffled[3]}
+				results2[idx] = playGame(gp, shuffled, sg.seed)
+			}(i)
+		}
+		wg.Wait()
+
+		// Apply training with shuffled ordering (map back to master NNs)
+		for ri, result := range results2 {
+			sg := shuffledGames[ri]
+			shuffledMasters := [4]*nn.JSDNN{masters[sg.order[0]], masters[sg.order[1]], masters[sg.order[2]], masters[sg.order[3]]}
+			applyTraining(shuffledMasters, []gameResult{result})
+			// Accumulate wins to the correct master's TotalWins2
+			for k := 0; k < 4; k++ {
+				shuffledMasters[k].TotalWins2 += result.playerWins[k]
+			}
 		}
 
-		for i := 0; i < sameGameIterations; i++ {
-			// TODO: bar
-			nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
-			rand.Shuffle(len(nnPlayers), func(i, j int) {
-				nnPlayers[i], nnPlayers[j] = nnPlayers[j], nnPlayers[i]
-			})
-			gp := [4]dominos.Player{nnPlayers[0], nnPlayers[1], nnPlayers[2], nnPlayers[3]}
-			tots := [4]*int{&nnPlayers[0].TotalWins2, &nnPlayers[1].TotalWins2, &nnPlayers[2].TotalWins2, &nnPlayers[3].TotalWins2}
-			randNum := rand.Int63n(9223372036854775607)
-			iter(gp, nnPlayers, tots, randNum)
-		}
-
-		// Disable exploration for benchmark against random players
+		// Phase 3: Benchmark against random players (no exploration)
 		savedEpsilon := [4]float64{jsdai1.Epsilon, jsdai2.Epsilon, jsdai3.Epsilon, jsdai4.Epsilon}
 		jsdai1.Epsilon = 0
 		jsdai2.Epsilon = 0
 		jsdai3.Epsilon = 0
 		jsdai4.Epsilon = 0
 
-		nnPlayers := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
-		gp := [4]dominos.Player{&dominos.ComputerPlayer{RandomMode: true}, &dominos.ComputerPlayer{RandomMode: true}, nnPlayers[2], &dominos.ComputerPlayer{RandomMode: true}}
-		tots := [4]*int{&totalRoundWins[0], &totalRoundWins[1], &totalRoundWins[2], &totalRoundWins[3]}
-		rand.Shuffle(len(nnPlayers), func(i, j int) {
-			gp[i], gp[j] = gp[j], gp[i]
-			tots[i], tots[j] = tots[j], tots[i]
+		// Pre-generate the benchmark shuffle and seeds
+		// Original: positions 0,1,3 are random players, position 2 is nnPlayers[2]
+		benchGP := [4]int{-1, -1, 2, -1} // -1 means random player, index means which NN
+		benchOrder := [4]int{0, 1, 2, 3}
+		rand.Shuffle(4, func(a, b int) {
+			benchGP[a], benchGP[b] = benchGP[b], benchGP[a]
+			benchOrder[a], benchOrder[b] = benchOrder[b], benchOrder[a]
 		})
 
+		benchSeeds := make([]int64, sameGameIterations)
+		for i := range benchSeeds {
+			benchSeeds[i] = rand.Int63n(9223372036854775607)
+		}
+
+		results3 := make([]gameResult, sameGameIterations)
 		for i := 0; i < sameGameIterations; i++ {
-			benchSeed := rand.Int63n(9223372036854775607)
-			iter(gp, nnPlayers, tots, benchSeed)
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(idx int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				clones := cloneNNs(masters)
+				// Set epsilon to 0 on clones for benchmark
+				for k := 0; k < 4; k++ {
+					clones[k].Epsilon = 0
+				}
+				var gp [4]dominos.Player
+				for k := 0; k < 4; k++ {
+					if benchGP[k] == -1 {
+						gp[k] = &dominos.ComputerPlayer{RandomMode: true}
+					} else {
+						gp[k] = clones[benchGP[k]]
+					}
+				}
+				results3[idx] = playGame(gp, clones, benchSeeds[idx])
+			}(i)
+		}
+		wg.Wait()
+
+		// Apply training on master NNs for benchmark games
+		applyTraining(masters, results3)
+		// Accumulate benchmark wins using the shuffled ordering
+		for _, result := range results3 {
+			for k := 0; k < 4; k++ {
+				totalRoundWins[benchOrder[k]] += result.playerWins[k]
+			}
 		}
 
 		// Restore exploration
@@ -375,6 +594,17 @@ func trainReinforced() {
 		jsdai2.Epsilon = savedEpsilon[1]
 		jsdai3.Epsilon = savedEpsilon[2]
 		jsdai4.Epsilon = savedEpsilon[3]
+
+		// Save models and metadata once per batch
+		iterationCount++
+		for i, name := range modelNames {
+			masters[i].Save("./results/" + name + ".mdl")
+			saveModelMeta("./results/"+name+".meta.json", modelMeta{
+				Iterations: iterationCount,
+				TotalWins:  masters[i].TotalWins,
+				TotalWins2: masters[i].TotalWins2,
+			})
+		}
 	}
 
 	jsdai1.Search = true
@@ -420,10 +650,14 @@ func trainReinforced() {
 		}
 	}
 
-	jsdai1.Save("./results/" + "jasai1.mdl")
-	jsdai2.Save("./results/" + "jasai2.mdl")
-	jsdai3.Save("./results/" + "jasai3.mdl")
-	jsdai4.Save("./results/" + "jasai4.mdl")
+	for i, name := range modelNames {
+		masters[i].Save("./results/" + name + ".mdl")
+		saveModelMeta("./results/"+name+".meta.json", modelMeta{
+			Iterations: iterationCount,
+			TotalWins:  masters[i].TotalWins,
+			TotalWins2: masters[i].TotalWins2,
+		})
+	}
 	log.Info("Took : ", time.Now().Sub(start))
 }
 
@@ -710,8 +944,8 @@ func duppyPlay() {
 }
 
 func main() {
-	// trainReinforced()
-	trainKerasReinforced()
+	trainReinforced()
+	// trainKerasReinforced()
 	// trainHuman()
 	// 69 / 333, 80/367, 194,997. 205,1085
 	// duppyPlay()
