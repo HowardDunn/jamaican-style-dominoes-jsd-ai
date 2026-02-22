@@ -245,7 +245,8 @@ type modelMeta struct {
 	Iterations int     `json:"iterations"`
 	TotalWins  int     `json:"total_wins"`
 	TotalWins2 int     `json:"total_wins_shuffled"`
-	Elo        float64 `json:"elo"`
+	EloNN      float64 `json:"elo_nn"`
+	EloBench   float64 `json:"elo_bench"`
 }
 
 const eloK = 32.0
@@ -498,16 +499,23 @@ func trainReinforced() {
 	jsdai2.TotalWins2 = metas[1].TotalWins2
 	jsdai3.TotalWins2 = metas[2].TotalWins2
 	jsdai4.TotalWins2 = metas[3].TotalWins2
-	elos := [4]float64{}
-	for i := range elos {
-		if metas[i].Elo > 0 {
-			elos[i] = metas[i].Elo
+	elosNN := [4]float64{}
+	elosBench := [4]float64{}
+	for i := range elosNN {
+		if metas[i].EloNN > 0 {
+			elosNN[i] = metas[i].EloNN
 		} else {
-			elos[i] = eloRandomPlayer // start at random player baseline
+			elosNN[i] = eloRandomPlayer
+		}
+		if metas[i].EloBench > 0 {
+			elosBench[i] = metas[i].EloBench
+		} else {
+			elosBench[i] = eloRandomPlayer
 		}
 	}
 	log.Info("Resuming from iteration: ", iterationCount)
-	log.Infof("Starting Elos: [%.1f, %.1f, %.1f, %.1f]", elos[0], elos[1], elos[2], elos[3])
+	log.Infof("Starting NN Elos: [%.1f, %.1f, %.1f, %.1f]", elosNN[0], elosNN[1], elosNN[2], elosNN[3])
+	log.Infof("Starting Bench Elos: [%.1f, %.1f, %.1f, %.1f]", elosBench[0], elosBench[1], elosBench[2], elosBench[3])
 
 	jsdai1.Epsilon = 0.1
 	jsdai2.Epsilon = 0.1
@@ -592,8 +600,8 @@ func trainReinforced() {
 				masters[k].TotalWins += r.playerWins[k]
 				rollingNN[k][rollingIdx] += r.playerWins[k]
 			}
-			// Update Elo from NN-vs-NN game (fixed order: position k = masters[k])
-			elos = updateEloMultiplayer(elos, r.playerWins)
+			// Update NN Elo (fixed order: position k = masters[k])
+			elosNN = updateEloMultiplayer(elosNN, r.playerWins)
 		}
 
 		// Phase 2: Shuffled NN players, parallel game simulation
@@ -643,11 +651,11 @@ func trainReinforced() {
 				shuffledMasters[k].TotalWins2 += result.playerWins[k]
 				rollingNN2[sg.order[k]][rollingIdx] += result.playerWins[k]
 			}
-			// Update Elo: remap position wins to master Elo indices
-			shuffledElos := [4]float64{elos[sg.order[0]], elos[sg.order[1]], elos[sg.order[2]], elos[sg.order[3]]}
+			// Update NN Elo: remap position wins to master Elo indices
+			shuffledElos := [4]float64{elosNN[sg.order[0]], elosNN[sg.order[1]], elosNN[sg.order[2]], elosNN[sg.order[3]]}
 			newShuffledElos := updateEloMultiplayer(shuffledElos, result.playerWins)
 			for k := 0; k < 4; k++ {
-				elos[sg.order[k]] = newShuffledElos[k]
+				elosNN[sg.order[k]] = newShuffledElos[k]
 			}
 		}
 
@@ -718,8 +726,8 @@ func trainReinforced() {
 				totalBenchGames[m] += benchOut[m*2+g].totalWins
 				rollingBench[m][rollingIdx] += benchOut[m*2+g].nnWins
 				rollingBenchGames[m][rollingIdx] += benchOut[m*2+g].totalWins
-				// Update Elo once per benchmark game (matches backend logic)
-				elos[m] = updateEloBench(elos[m], benchOut[m*2+g].nnWins)
+				// Update bench Elo once per benchmark game (matches backend logic)
+				elosBench[m] = updateEloBench(elosBench[m], benchOut[m*2+g].nnWins)
 			}
 		}
 
@@ -741,6 +749,8 @@ func trainReinforced() {
 				Iterations: iterationCount,
 				TotalWins:  masters[i].TotalWins,
 				TotalWins2: masters[i].TotalWins2,
+				EloNN:      elosNN[i],
+				EloBench:   elosBench[i],
 			})
 		}
 	}
@@ -768,7 +778,9 @@ func trainReinforced() {
 	eloWriter := csv.NewWriter(eloFile)
 	defer eloWriter.Flush()
 	if !eloFileExists {
-		eloWriter.Write([]string{"iteration", modelNames[0], modelNames[1], modelNames[2], modelNames[3]})
+		eloWriter.Write([]string{"iteration",
+			modelNames[0] + "_nn", modelNames[1] + "_nn", modelNames[2] + "_nn", modelNames[3] + "_nn",
+			modelNames[0] + "_bench", modelNames[1] + "_bench", modelNames[2] + "_bench", modelNames[3] + "_bench"})
 		eloWriter.Flush()
 	}
 
@@ -799,17 +811,17 @@ func trainReinforced() {
 			if rollingGames > 0 {
 				rollingRate = float64(rollingWins) / float64(rollingGames)
 			}
-			log.Infof("Bench %s: total=%.4f (%d/%d)  rolling1k=%.4f (%d/%d)  elo=%.1f",
+			log.Infof("Bench %s: total=%.4f (%d/%d)  rolling1k=%.4f (%d/%d)  eloNN=%.1f  eloBench=%.1f",
 				modelNames[m], rate, totalRoundWins[m], totalBenchGames[m],
-				rollingRate, rollingWins, rollingGames, elos[m])
+				rollingRate, rollingWins, rollingGames, elosNN[m], elosBench[m])
 		}
 		// Write Elo to CSV
 		eloWriter.Write([]string{
 			fmt.Sprintf("%d", iterationCount),
-			fmt.Sprintf("%.1f", elos[0]),
-			fmt.Sprintf("%.1f", elos[1]),
-			fmt.Sprintf("%.1f", elos[2]),
-			fmt.Sprintf("%.1f", elos[3]),
+			fmt.Sprintf("%.1f", elosNN[0]), fmt.Sprintf("%.1f", elosNN[1]),
+			fmt.Sprintf("%.1f", elosNN[2]), fmt.Sprintf("%.1f", elosNN[3]),
+			fmt.Sprintf("%.1f", elosBench[0]), fmt.Sprintf("%.1f", elosBench[1]),
+			fmt.Sprintf("%.1f", elosBench[2]), fmt.Sprintf("%.1f", elosBench[3]),
 		})
 		eloWriter.Flush()
 		log.Info("NN Wins: ", []int{jsdai1.TotalWins, jsdai2.TotalWins, jsdai3.TotalWins, jsdai4.TotalWins})
@@ -841,7 +853,8 @@ func trainReinforced() {
 			Iterations: iterationCount,
 			TotalWins:  masters[i].TotalWins,
 			TotalWins2: masters[i].TotalWins2,
-			Elo:        elos[i],
+			EloNN:      elosNN[i],
+			EloBench:   elosBench[i],
 		})
 	}
 	log.Info("Took : ", time.Now().Sub(start))
