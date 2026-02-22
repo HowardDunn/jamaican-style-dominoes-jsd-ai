@@ -419,10 +419,10 @@ func trainReinforced() {
 	maxGames := 100
 	numWorkers := runtime.NumCPU()
 	totalRoundWins := [4]int{}
-	jsdai1 := nn.New(126, []int{150}, 56)
-	jsdai2 := nn.New(126, []int{64, 64}, 56)
-	jsdai3 := nn.New(126, []int{32, 32}, 56)
-	jsdai4 := nn.New(126, []int{128, 128}, 56)
+	jsdai1 := nn.New(126, []int{202}, 56)
+	jsdai2 := nn.New(126, []int{64, 32}, 56)
+	jsdai3 := nn.New(126, []int{204, 102}, 56)
+	jsdai4 := nn.New(126, []int{128, 64}, 56)
 	jsdai1.OutputActivation = "linear"
 	jsdai2.OutputActivation = "linear"
 	jsdai3.OutputActivation = "linear"
