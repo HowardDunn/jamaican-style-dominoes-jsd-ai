@@ -380,8 +380,41 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 		reward = reward * 1.5
 	}
 
-	// Normalize reward from [-7, 10.5] to [0, 1] for stable linear output training
-	reward = (reward + 7.0) / 17.5
+	// Board control bonus: count playable cards remaining after this play.
+	// Rewards posing strong cards and maintaining board control.
+	suit1, suit2 := dominos.GetCLIDominos()[gameEvent.Card].GetSuits()
+	newLeftSuit := gameEvent.BoardState.LeftSuit
+	newRightSuit := gameEvent.BoardState.RightSuit
+	if gameEvent.EventType == dominos.PosedCard || !gameEvent.BoardState.CardPosed {
+		newLeftSuit = suit1
+		newRightSuit = suit2
+	} else if gameEvent.Side == dominos.Left {
+		if suit1 == gameEvent.BoardState.LeftSuit {
+			newLeftSuit = suit2
+		} else {
+			newLeftSuit = suit1
+		}
+	} else {
+		if suit1 == gameEvent.BoardState.RightSuit {
+			newRightSuit = suit2
+		} else {
+			newRightSuit = suit1
+		}
+	}
+	playableCards := 0
+	for _, card := range gameEvent.PlayerHands[0] {
+		if card == gameEvent.Card || card >= 28 {
+			continue
+		}
+		cs1, cs2 := dominos.GetCLIDominos()[card].GetSuits()
+		if cs1 == newLeftSuit || cs2 == newLeftSuit || cs1 == newRightSuit || cs2 == newRightSuit {
+			playableCards++
+		}
+	}
+	reward += 0.3 * float64(playableCards)
+
+	// Normalize reward from [-7, ~12.5] to [0, 1] for stable linear output training
+	reward = (reward + 7.0) / 19.5
 
 	cardChoice[index] = reward
 	res := tensor.New(tensor.WithShape(56), tensor.WithBacking(cardChoice[:]))
