@@ -312,8 +312,7 @@ func (j *JSDNN) ConvertCardChoiceToTensor(gameEvent *dominos.GameEvent) tensor.T
 }
 
 func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent, nextGameEvents [16]*dominos.GameEvent) tensor.Tensor {
-	// Reward based on: immediate tactical consequences (passes/blocks in first rotation)
-	// plus a discounted round outcome signal that reaches all plays in the round.
+	// Reward based on immediate tactical consequences (passes/blocks in first rotation)
 
 	cardChoice := [56]float64{}
 	index := gameEvent.Card
@@ -322,9 +321,7 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 		index = index + 28
 		suitPlayed = gameEvent.BoardState.RightSuit
 	}
-
-	// Tactical reward from immediate next rotation (4 events)
-	tacticalReward := 0.0
+	reward := 0.0
 	chainBroken := false
 	hasHardEnd := false
 	boardSuitCount := gameEvent.BoardState.CountSuit(suitPlayed)
@@ -333,91 +330,58 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 	if boardSuitCount+handSuitCount == 6 {
 		hasHardEnd = true
 	}
-
-	// Scan all available next events (up to 16) for round outcome + tactical info
 	won := false
 	wonByBlock := true
-	roundOutcome := 0.0    // raw round win/loss reward
-	roundFound := false    // whether we found a round end
-	eventsToRoundEnd := 0  // distance to round end
-
 	for i, nextEvent := range nextGameEvents {
-		if nextEvent == nil {
+		if nextEvent == nil || i > 4 {
 			break
 		}
 
-		// Tactical rewards: only from the first rotation (4 events)
-		if i < 4 {
-			switch nextEvent.EventType {
-			case dominos.Passed:
-				if nextEvent.Player == 0 {
-					tacticalReward = -1.0
-				} else if !chainBroken {
-					tacticalReward = tacticalReward + 1.0
-				}
-			case dominos.PlayedCard:
-				if nextEvent.Player != 0 {
-					chainBroken = true
-				}
-			}
-		}
-
-		// Round outcome: scan all 16 events
 		switch nextEvent.EventType {
+		case dominos.Passed:
+			if nextEvent.Player == 0 {
+				reward = -1.0
+			} else if !chainBroken {
+				reward = reward + 1.0
+			}
+		case dominos.PlayedCard:
+			if nextEvent.Player != 0 {
+				chainBroken = true
+			}
 		case dominos.RoundWin:
-			if !roundFound {
-				eventsToRoundEnd = i + 1
-				roundFound = true
-				if nextEvent.Player == 0 {
-					roundOutcome = 7.0
-					won = true
-				} else {
-					roundOutcome = -7.0
+			if nextEvent.Player == 0 {
+				reward = 7.0
+				won = true
+			} else {
+				reward = -7.0
+				wonByBlock = false
+			}
+
+			for k := 0; k < len(nextEvent.PlayerCardsRemaining); k++ {
+				if nextEvent.PlayerCardsRemaining[k] == 0 {
 					wonByBlock = false
-				}
-				for k := 0; k < len(nextEvent.PlayerCardsRemaining); k++ {
-					if nextEvent.PlayerCardsRemaining[k] == 0 {
-						wonByBlock = false
-						break
-					}
+					break
 				}
 			}
 		case dominos.RoundDraw:
-			if !roundFound {
-				eventsToRoundEnd = i + 1
-				roundFound = true
-				wonByBlock = false
-			}
+			wonByBlock = false
 		}
 	}
 
 	if !won {
 		wonByBlock = false
 	}
-
-	// Apply context bonuses to tactical reward
 	if hasHardEnd && !won {
-		tacticalReward = -5.0
+		reward = -5.0
 	} else if isDouble && !won {
-		tacticalReward = tacticalReward + 3.0
+		reward = reward + 3.0
 	}
 	if wonByBlock {
-		roundOutcome = roundOutcome * 1.5
+		reward = reward * 1.5
 	}
 
-	// Combine: tactical reward + discounted round outcome
-	// Discount decays with distance: plays right before the win get full credit,
-	// early plays get partial credit. Decay = 0.85^distance
-	reward := tacticalReward
-	if roundFound {
-		discount := math.Pow(0.85, float64(eventsToRoundEnd))
-		reward = reward + roundOutcome*discount
-	}
-
-	// Normalize reward to [0, 1] for stable training
-	// Range: min = -7 + (-7)*1 = -14, max = 3 + 10.5*1 = 13.5
-	// Use conservative bounds: [-14, 14]
-	reward = (reward + 14.0) / 28.0
+	// Normalize reward from [-7, 10.5] to [0, 1] for stable linear output training
+	reward = (reward + 7.0) / 17.5
 
 	cardChoice[index] = reward
 	res := tensor.New(tensor.WithShape(56), tensor.WithBacking(cardChoice[:]))
