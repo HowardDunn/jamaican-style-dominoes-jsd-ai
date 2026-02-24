@@ -772,11 +772,11 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 			}
 			log.Warn(" ", hand[i], " ", compatible(hand[i], "left"), " ", compatible(hand[i], "right"))
 			if compatible(hand[i], "right"){
-				choice.Side = dominoes.Right
+				choice.Side = dominos.Right
 				choice.Card = uint(hand[i])
 			}
 			if compatible(hand[i],"left"){
-				choice.Side = dominoes.Right
+				choice.Side = dominos.Right
 				choice.Card = uint(hand[i])
 			}
 		}
