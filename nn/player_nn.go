@@ -158,6 +158,21 @@ func clipValue(x float64) float64 {
 	return x
 }
 
+const weightDecay = 0.9999
+
+func clipGrad(x float64) float64 {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return 0.0
+	}
+	if x > 1.0 {
+		return 1.0
+	}
+	if x < -1.0 {
+		return -1.0
+	}
+	return x
+}
+
 func sum(x []float64) float64 {
 	s := 0.0
 	for i := range x {
@@ -990,17 +1005,26 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 		return 0.0, err
 	}
 
+	// Clip weight gradients to prevent NaN/Inf from corrupting weights
+	dcost_dfinal.Apply(clipGrad, tensor.UseUnsafe())
+	dcost_dbiasfinal.Apply(clipGrad, tensor.UseUnsafe())
+
+	// Weight decay: shrink weights toward 0 to prevent unbounded drift
+	_, err = tensor.Mul(j.final, weightDecay, tensor.UseUnsafe())
+	if err != nil {
+		log.Fatal(err, " ", "decay_final")
+		return 0.0, err
+	}
+
 	_, err = tensor.Add(j.final, dcost_dfinal, tensor.UseUnsafe())
 	if err != nil {
 		log.Fatal(err, " ", "add6")
-		log.Fatal(err, " ", "16")
 		return 0.0, err
 	}
 
 	_, err = tensor.Add(j.bFinal, dcost_dbiasfinal, tensor.UseUnsafe())
 	if err != nil {
 		log.Fatal(err, " ", "add19")
-		log.Fatal(err, " ", "17")
 		return 0.0, err
 	}
 
@@ -1014,6 +1038,17 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 	_, err = tensor.Mul(dcost_dhidden, lastHiddenLR, tensor.UseUnsafe())
 	if err != nil {
 		log.Fatal(err, " ", "15")
+		return 0.0, err
+	}
+
+	// Clip weight gradients to prevent NaN/Inf from corrupting weights
+	dcost_dhidden.Apply(clipGrad, tensor.UseUnsafe())
+	dcost_dbiashidden.Apply(clipGrad, tensor.UseUnsafe())
+
+	// Weight decay
+	_, err = tensor.Mul(j.hidden[len(j.hidden)-1], weightDecay, tensor.UseUnsafe())
+	if err != nil {
+		log.Fatal(err, " ", "decay_hidden_last")
 		return 0.0, err
 	}
 
@@ -1080,6 +1115,17 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 		_, err = tensor.Mul(dcost_dhidden, hiddenLR, tensor.UseUnsafe())
 		if err != nil {
 			log.Fatal(err, " ", "15")
+			return 0.0, err
+		}
+
+		// Clip weight gradients to prevent NaN/Inf from corrupting weights
+		dcost_dhidden.Apply(clipGrad, tensor.UseUnsafe())
+		dcost_dbiashidden.Apply(clipGrad, tensor.UseUnsafe())
+
+		// Weight decay
+		_, err = tensor.Mul(j.hidden[i-1], weightDecay, tensor.UseUnsafe())
+		if err != nil {
+			log.Fatal(err, " ", "decay_hidden")
 			return 0.0, err
 		}
 
