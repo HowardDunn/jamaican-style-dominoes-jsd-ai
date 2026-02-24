@@ -767,7 +767,18 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 		log.Errorf("No card to play found. Max confidence: %.7f Player: %d Hand: %#v Hand2: %#v Confidences: %#v Event: %s", maxConfidence, gameEvent.Player, gameEvent.PlayerHands[gameEvent.Player], j.GetHand(), cardConfidences, gameEvent.EventType)
 		hand := gameEvent.PlayerHands[gameEvent.Player]
 		for i := range hand {
+			if i > 27{
+				continue
+			}
 			log.Warn(" ", hand[i], " ", compatible(hand[i], "left"), " ", compatible(hand[i], "right"))
+			if compatible(hand[i], "right"){
+				choice.Side = dominoes.Right
+				choice.Card = uint(hand[i])
+			}
+			if compatible(hand[i],"left"){
+				choice.Side = dominoes.Right
+				choice.Card = uint(hand[i])
+			}
 		}
 	}
 	// if maxConfidence < 0 {
