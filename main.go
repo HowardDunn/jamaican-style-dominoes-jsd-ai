@@ -249,9 +249,11 @@ type modelMeta struct {
 	EloBench   float64 `json:"elo_bench"`
 }
 
-const eloK = 32.0
-const eloMaxRoundWins = 6.0
-const eloRandomPlayer = 1000.0
+const (
+	eloK            = 32.0
+	eloMaxRoundWins = 6.0
+	eloRandomPlayer = 1000.0
+)
 
 // updateEloBench calculates a new Elo rating for a model after a benchmark game
 // against 3 random players (each at eloRandomPlayer). Matches backend logic.
@@ -778,9 +780,407 @@ func trainReinforced() {
 	eloWriter := csv.NewWriter(eloFile)
 	defer eloWriter.Flush()
 	if !eloFileExists {
-		eloWriter.Write([]string{"iteration",
+		eloWriter.Write([]string{
+			"iteration",
 			modelNames[0] + "_nn", modelNames[1] + "_nn", modelNames[2] + "_nn", modelNames[3] + "_nn",
-			modelNames[0] + "_bench", modelNames[1] + "_bench", modelNames[2] + "_bench", modelNames[3] + "_bench"})
+			modelNames[0] + "_bench", modelNames[1] + "_bench", modelNames[2] + "_bench", modelNames[3] + "_bench",
+		})
+		eloWriter.Flush()
+	}
+
+	randomSeed := time.Now().UnixNano()
+	log.Info("Using random Seed: ", randomSeed)
+	rand.Seed(randomSeed)
+	for j := 0; j < maxGames; j++ {
+		randNum := rand.Int63n(9223372036854775607)
+		reinForceMentLearn(randNum)
+		log.Info("Games Seen: ", j+1)
+		// Per-model benchmark win rates (each model vs 3 random players, 25% = random baseline)
+		for m := 0; m < 4; m++ {
+			rate := 0.0
+			if totalBenchGames[m] > 0 {
+				rate = float64(totalRoundWins[m]) / float64(totalBenchGames[m])
+			}
+			rollingWins := 0
+			rollingGames := 0
+			n := rollingCount
+			if n > rollingSize {
+				n = rollingSize
+			}
+			for i := 0; i < n; i++ {
+				rollingWins += rollingBench[m][i]
+				rollingGames += rollingBenchGames[m][i]
+			}
+			rollingRate := 0.0
+			if rollingGames > 0 {
+				rollingRate = float64(rollingWins) / float64(rollingGames)
+			}
+			log.Infof("Bench %s: total=%.4f (%d/%d)  rolling1k=%.4f (%d/%d)  eloNN=%.1f  eloBench=%.1f",
+				modelNames[m], rate, totalRoundWins[m], totalBenchGames[m],
+				rollingRate, rollingWins, rollingGames, elosNN[m], elosBench[m])
+		}
+		// Write Elo to CSV
+		eloWriter.Write([]string{
+			fmt.Sprintf("%d", iterationCount),
+			fmt.Sprintf("%.1f", elosNN[0]), fmt.Sprintf("%.1f", elosNN[1]),
+			fmt.Sprintf("%.1f", elosNN[2]), fmt.Sprintf("%.1f", elosNN[3]),
+			fmt.Sprintf("%.1f", elosBench[0]), fmt.Sprintf("%.1f", elosBench[1]),
+			fmt.Sprintf("%.1f", elosBench[2]), fmt.Sprintf("%.1f", elosBench[3]),
+		})
+		eloWriter.Flush()
+		log.Info("NN Wins: ", []int{jsdai1.TotalWins, jsdai2.TotalWins, jsdai3.TotalWins, jsdai4.TotalWins})
+		log.Info("NN Wins2: ", []int{jsdai1.TotalWins2, jsdai2.TotalWins2, jsdai3.TotalWins2, jsdai4.TotalWins2})
+		n1 := float64(jsdai1.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
+		n2 := float64(jsdai2.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
+		n3 := float64(jsdai3.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
+		n4 := float64(jsdai4.TotalWins) / float64(jsdai1.TotalWins+jsdai2.TotalWins+jsdai3.TotalWins+jsdai4.TotalWins)
+		log.Info("NN Ratios: ", []float64{n1, n2, n3, n4})
+		log.Info("NN Ratios Rolling 1k: ", rollingRatios(rollingNN, rollingCount))
+		n21 := float64(jsdai1.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
+		n22 := float64(jsdai2.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
+		n23 := float64(jsdai3.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
+		n24 := float64(jsdai4.TotalWins2) / float64(jsdai1.TotalWins2+jsdai2.TotalWins2+jsdai3.TotalWins2+jsdai4.TotalWins2)
+		log.Info("NN Ratios2: ", []float64{n21, n22, n23, n24})
+		log.Info("NN Ratios2 Rolling 1k: ", rollingRatios(rollingNN2, rollingCount))
+		if j > 1 {
+			jsdai1.Search = false
+			jsdai2.Search = false
+			jsdai3.Search = false
+			jsdai4.Search = false
+
+		}
+	}
+
+	for i, name := range modelNames {
+		masters[i].Save("./results/" + name + ".mdl")
+		saveModelMeta("./results/"+name+".meta.json", modelMeta{
+			Iterations: iterationCount,
+			TotalWins:  masters[i].TotalWins,
+			TotalWins2: masters[i].TotalWins2,
+			EloNN:      elosNN[i],
+			EloBench:   elosBench[i],
+		})
+	}
+	log.Info("Took : ", time.Now().Sub(start))
+}
+
+func trainReinforcedAttention() {
+	// Train Reinforcement with Attention
+	start := time.Now()
+
+	sameGameIterations := 8
+	maxGames := 100000
+	numWorkers := runtime.NumCPU()
+	totalRoundWins := [4]int{}
+	totalBenchGames := [4]int{}
+	jsdai1 := nn.New(126, []int{256}, 56)
+	jsdai2 := nn.New(126, []int{512, 256}, 56)
+	jsdai3 := nn.New(126, []int{384, 192}, 56)
+	jsdai4 := nn.New(126, []int{256, 128}, 56)
+	jsdai1.OutputActivation = "linear"
+	jsdai2.OutputActivation = "linear"
+	jsdai3.OutputActivation = "linear"
+	jsdai4.OutputActivation = "linear"
+	jsdai1.EnableAttention(28)
+	jsdai2.EnableAttention(28)
+	jsdai3.EnableAttention(28)
+	jsdai4.EnableAttention(28)
+	jsdai1.Load("./results/" + "jasai_attn1.mdl")
+	jsdai2.Load("./results/" + "jasai_attn2.mdl")
+	jsdai3.Load("./results/" + "jasai_attn3.mdl")
+	jsdai4.Load("./results/" + "jasai_attn4.mdl")
+
+	// Load metadata to resume iteration counts and win totals
+	modelNames := [4]string{"jasai_attn1", "jasai_attn2", "jasai_attn3", "jasai_attn4"}
+	metas := [4]modelMeta{}
+	for i, name := range modelNames {
+		metas[i] = loadModelMeta("./results/" + name + ".meta.json")
+	}
+	iterationCount := metas[0].Iterations
+	jsdai1.TotalWins = metas[0].TotalWins
+	jsdai2.TotalWins = metas[1].TotalWins
+	jsdai3.TotalWins = metas[2].TotalWins
+	jsdai4.TotalWins = metas[3].TotalWins
+	jsdai1.TotalWins2 = metas[0].TotalWins2
+	jsdai2.TotalWins2 = metas[1].TotalWins2
+	jsdai3.TotalWins2 = metas[2].TotalWins2
+	jsdai4.TotalWins2 = metas[3].TotalWins2
+	elosNN := [4]float64{}
+	elosBench := [4]float64{}
+	for i := range elosNN {
+		if metas[i].EloNN > 0 {
+			elosNN[i] = metas[i].EloNN
+		} else {
+			elosNN[i] = eloRandomPlayer
+		}
+		if metas[i].EloBench > 0 {
+			elosBench[i] = metas[i].EloBench
+		} else {
+			elosBench[i] = eloRandomPlayer
+		}
+	}
+	log.Info("Resuming from iteration: ", iterationCount)
+	log.Infof("Starting NN Elos: [%.1f, %.1f, %.1f, %.1f]", elosNN[0], elosNN[1], elosNN[2], elosNN[3])
+	log.Infof("Starting Bench Elos: [%.1f, %.1f, %.1f, %.1f]", elosBench[0], elosBench[1], elosBench[2], elosBench[3])
+
+	jsdai1.Epsilon = 0.1
+	jsdai2.Epsilon = 0.1
+	jsdai3.Epsilon = 0.1
+	jsdai4.Epsilon = 0.1
+
+	masters := [4]*nn.JSDNN{jsdai1, jsdai2, jsdai3, jsdai4}
+
+	// Rolling window buffers (last 1000 iterations) for win tracking
+	const rollingSize = 1000
+	rollingNN := [4][]int{}
+	rollingNN2 := [4][]int{}
+	rollingBench := [4][]int{}
+	rollingBenchGames := [4][]int{}
+	rollingIdx := 0
+	rollingCount := 0
+
+	rollingRatios := func(buf [4][]int, count int) []float64 {
+		total := 0
+		sums := [4]int{}
+		n := count
+		if n > rollingSize {
+			n = rollingSize
+		}
+		for p := 0; p < 4; p++ {
+			for i := 0; i < n; i++ {
+				sums[p] += buf[p][i]
+			}
+			total += sums[p]
+		}
+		if total == 0 {
+			return []float64{0, 0, 0, 0}
+		}
+		return []float64{
+			float64(sums[0]) / float64(total),
+			float64(sums[1]) / float64(total),
+			float64(sums[2]) / float64(total),
+			float64(sums[3]) / float64(total),
+		}
+	}
+
+	// Pre-allocate ring buffers
+	for p := 0; p < 4; p++ {
+		rollingNN[p] = make([]int, rollingSize)
+		rollingNN2[p] = make([]int, rollingSize)
+		rollingBench[p] = make([]int, rollingSize)
+		rollingBenchGames[p] = make([]int, rollingSize)
+	}
+
+	reinForceMentLearn := func(r int64) {
+		// Phase 1: Fixed-order NN players, parallel game simulation
+		seeds := make([]int64, sameGameIterations)
+		for i := range seeds {
+			seeds[i] = rand.Int63n(9223372036854775607)
+		}
+
+		results := make([]gameResult, sameGameIterations)
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, numWorkers)
+
+		for i := 0; i < sameGameIterations; i++ {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(idx int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				clones := cloneNNs(masters)
+				gp := [4]dominos.Player{clones[0], clones[1], clones[2], clones[3]}
+				results[idx] = playGame(gp, clones, seeds[idx])
+			}(i)
+		}
+		wg.Wait()
+
+		// Apply training sequentially on master NNs
+		applyTraining(masters, results)
+		// Accumulate wins and record rolling window
+		for p := 0; p < 4; p++ {
+			rollingNN[p][rollingIdx] = 0
+		}
+		for _, r := range results {
+			for k := 0; k < 4; k++ {
+				masters[k].TotalWins += r.playerWins[k]
+				rollingNN[k][rollingIdx] += r.playerWins[k]
+			}
+			// Update NN Elo (fixed order: position k = masters[k])
+			elosNN = updateEloMultiplayer(elosNN, r.playerWins)
+		}
+
+		// Phase 2: Shuffled NN players, parallel game simulation
+		type shuffledGame struct {
+			order [4]int
+			seed  int64
+		}
+		shuffledGames := make([]shuffledGame, sameGameIterations)
+		for i := range shuffledGames {
+			order := [4]int{0, 1, 2, 3}
+			rand.Shuffle(4, func(a, b int) { order[a], order[b] = order[b], order[a] })
+			shuffledGames[i] = shuffledGame{
+				order: order,
+				seed:  rand.Int63n(9223372036854775607),
+			}
+		}
+
+		results2 := make([]gameResult, sameGameIterations)
+		for i := 0; i < sameGameIterations; i++ {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(idx int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				sg := shuffledGames[idx]
+				clones := cloneNNs(masters)
+				shuffled := [4]*nn.JSDNN{clones[sg.order[0]], clones[sg.order[1]], clones[sg.order[2]], clones[sg.order[3]]}
+				gp := [4]dominos.Player{shuffled[0], shuffled[1], shuffled[2], shuffled[3]}
+				results2[idx] = playGame(gp, shuffled, sg.seed)
+			}(i)
+		}
+		wg.Wait()
+
+		// Apply training with shuffled ordering (map back to master NNs)
+		for p := 0; p < 4; p++ {
+			rollingNN2[p][rollingIdx] = 0
+		}
+		for ri, result := range results2 {
+			sg := shuffledGames[ri]
+			shuffledMasters := [4]*nn.JSDNN{masters[sg.order[0]], masters[sg.order[1]], masters[sg.order[2]], masters[sg.order[3]]}
+			applyTraining(shuffledMasters, []gameResult{result})
+			for k := 0; k < 4; k++ {
+				shuffledMasters[k].TotalWins2 += result.playerWins[k]
+				rollingNN2[sg.order[k]][rollingIdx] += result.playerWins[k]
+			}
+			shuffledElos := [4]float64{elosNN[sg.order[0]], elosNN[sg.order[1]], elosNN[sg.order[2]], elosNN[sg.order[3]]}
+			newShuffledElos := updateEloMultiplayer(shuffledElos, result.playerWins)
+			for k := 0; k < 4; k++ {
+				elosNN[sg.order[k]] = newShuffledElos[k]
+			}
+		}
+
+		// Phase 3: Benchmark each model individually against 3 random players (no exploration)
+		savedEpsilon := [4]float64{jsdai1.Epsilon, jsdai2.Epsilon, jsdai3.Epsilon, jsdai4.Epsilon}
+		jsdai1.Epsilon = 0
+		jsdai2.Epsilon = 0
+		jsdai3.Epsilon = 0
+		jsdai4.Epsilon = 0
+
+		for p := 0; p < 4; p++ {
+			rollingBench[p][rollingIdx] = 0
+			rollingBenchGames[p][rollingIdx] = 0
+		}
+
+		type benchResult struct {
+			nnWins    int
+			totalWins int
+		}
+		benchOut := make([]benchResult, 4*2)
+		benchSeeds := make([]int64, 4*2)
+		benchPositions := make([]int, 4*2)
+		for i := range benchSeeds {
+			benchSeeds[i] = rand.Int63n(9223372036854775607)
+			benchPositions[i] = rand.Intn(4)
+		}
+
+		for i := 0; i < 4*2; i++ {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(idx int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				modelIdx := idx / 2
+				pos := benchPositions[idx]
+				clone := masters[modelIdx].Clone()
+				clone.Epsilon = 0
+				clone.Search = masters[modelIdx].Search
+				clone.SearchNum = masters[modelIdx].SearchNum
+				var gp [4]dominos.Player
+				dummyNNs := cloneNNs(masters)
+				for k := 0; k < 4; k++ {
+					dummyNNs[k].Epsilon = 0
+				}
+				for k := 0; k < 4; k++ {
+					if k == pos {
+						gp[k] = clone
+					} else {
+						gp[k] = &dominos.ComputerPlayer{RandomMode: true}
+					}
+				}
+				result := playGame(gp, dummyNNs, benchSeeds[idx])
+				total := 0
+				for k := 0; k < 4; k++ {
+					total += result.playerWins[k]
+				}
+				benchOut[idx] = benchResult{nnWins: result.playerWins[pos], totalWins: total}
+			}(i)
+		}
+		wg.Wait()
+
+		// Accumulate per-model benchmark wins and update Elo per game
+		for m := 0; m < 4; m++ {
+			for g := 0; g < 2; g++ {
+				totalRoundWins[m] += benchOut[m*2+g].nnWins
+				totalBenchGames[m] += benchOut[m*2+g].totalWins
+				rollingBench[m][rollingIdx] += benchOut[m*2+g].nnWins
+				rollingBenchGames[m][rollingIdx] += benchOut[m*2+g].totalWins
+				elosBench[m] = updateEloBench(elosBench[m], benchOut[m*2+g].nnWins)
+			}
+		}
+
+		// Restore exploration
+		jsdai1.Epsilon = savedEpsilon[0]
+		jsdai2.Epsilon = savedEpsilon[1]
+		jsdai3.Epsilon = savedEpsilon[2]
+		jsdai4.Epsilon = savedEpsilon[3]
+
+		// Advance rolling window
+		rollingIdx = (rollingIdx + 1) % rollingSize
+		rollingCount++
+
+		// Save models and metadata once per batch
+		iterationCount++
+		for i, name := range modelNames {
+			masters[i].Save("./results/" + name + ".mdl")
+			saveModelMeta("./results/"+name+".meta.json", modelMeta{
+				Iterations: iterationCount,
+				TotalWins:  masters[i].TotalWins,
+				TotalWins2: masters[i].TotalWins2,
+				EloNN:      elosNN[i],
+				EloBench:   elosBench[i],
+			})
+		}
+	}
+
+	jsdai1.Search = true
+	jsdai1.SearchNum = 100
+	jsdai2.Search = true
+	jsdai2.SearchNum = 100
+	jsdai3.Search = true
+	jsdai3.SearchNum = 100
+	jsdai4.Search = true
+	jsdai4.SearchNum = 100
+
+	// Open CSV for Elo tracking (append mode)
+	eloCSVPath := "./results/elo_history_attn.csv"
+	eloFileExists := false
+	if _, err := os.Stat(eloCSVPath); err == nil {
+		eloFileExists = true
+	}
+	eloFile, err := os.OpenFile(eloCSVPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.Fatal("Failed to open elo CSV: ", err)
+	}
+	defer eloFile.Close()
+	eloWriter := csv.NewWriter(eloFile)
+	defer eloWriter.Flush()
+	if !eloFileExists {
+		eloWriter.Write([]string{
+			"iteration",
+			modelNames[0] + "_nn", modelNames[1] + "_nn", modelNames[2] + "_nn", modelNames[3] + "_nn",
+			modelNames[0] + "_bench", modelNames[1] + "_bench", modelNames[2] + "_bench", modelNames[3] + "_bench",
+		})
 		eloWriter.Flush()
 	}
 
@@ -1086,6 +1486,7 @@ func duppyPlay() {
 	}
 	joinedGame := false
 	gamesPlayed := 0
+	playedGames := map[string]bool{}
 	for {
 		onlineTables, err := duppy.GetOnlineTableList(token)
 		if err != nil {
@@ -1094,10 +1495,11 @@ func duppyPlay() {
 		}
 
 		for _, table := range onlineTables {
-			if table.PlayerInvolved && table.GameState == "running" {
+			if table.PlayerInvolved && table.GameState == "running" && !playedGames[table.GameID] {
 				log.Info("Playing game: ", table.GameID)
 				duppy.PlayGame(table, token)
 				gamesPlayed++
+				playedGames[table.GameID] = true
 				log.Info("Finished playing game: ", table.GameID, " Num Played: ", gamesPlayed)
 				joinedGame = false
 				onlineTables = []*duppy.OnlineGameTable{}
@@ -1143,7 +1545,8 @@ func duppyPlay() {
 }
 
 func main() {
-	trainReinforced()
+	// trainReinforced()
+	trainReinforcedAttention()
 	// trainKerasReinforced()
 	// trainHuman()
 	// 69 / 333, 80/367, 194,997. 205,1085

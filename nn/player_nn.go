@@ -3,6 +3,7 @@ package nn
 import (
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"os"
@@ -26,18 +27,28 @@ type JSDNN struct {
 	bHidden []*tensor.Dense
 	bFinal  *tensor.Dense
 	*dominos.ComputerPlayer
-	passMemory    [28]float64
-	TotalWins     int
-	TotalWins2    int
-	inputDim      int
-	hiddenDim     []int
-	outputDim     int
-	gameType      string
-	knownNotHaves [4]map[uint]bool
+	passMemory       [28]float64
+	TotalWins        int
+	TotalWins2       int
+	inputDim         int
+	hiddenDim        []int
+	outputDim        int
+	gameType         string
+	knownNotHaves    [4]map[uint]bool
 	Search           bool
 	SearchNum        int
 	OutputActivation string  // "relu" or "linear"
 	Epsilon          float64 // epsilon-greedy exploration rate (0.0 = greedy, 0.1 = 10% random)
+
+	// Attention layer fields
+	useAttention  bool
+	attnNumTokens int
+	attnDToken    int
+	attnDModel    int
+	wQ, wK, wV, wO *tensor.Dense
+	bQ, bK, bV, bO *tensor.Dense
+	AttentionLR    float64
+	TrainMode      string // "manual" (default) or "autograd"
 }
 
 func fillRandom(a []float64, v float64) {
@@ -469,6 +480,13 @@ func (j *JSDNN) GetOutputMask(gameEvent *dominos.GameEvent) tensor.Tensor {
 }
 
 func (j *JSDNN) predict(a tensor.Tensor) (tensor.Tensor, error) {
+	// If attention is enabled, preprocess through attention layer
+	if j.useAttention {
+		flat := a.Data().([]float64)
+		projected, _ := j.attentionForward(flat)
+		a = tensor.New(tensor.WithShape(len(projected)), tensor.WithBacking(projected))
+	}
+
 	hidden, err := j.hidden[0].MatVecMul(a)
 	if err != nil {
 		return nil, err
@@ -539,6 +557,7 @@ func (j *JSDNN) Clone() *JSDNN {
 	clone.final = j.final.Clone().(*tensor.Dense)
 	clone.bFinal = j.bFinal.Clone().(*tensor.Dense)
 	clone.OutputActivation = j.OutputActivation
+	clone.TrainMode = j.TrainMode
 
 	for i := range clone.hidden {
 		clone.hidden[i] = j.hidden[i].Clone().(*tensor.Dense)
@@ -546,6 +565,22 @@ func (j *JSDNN) Clone() *JSDNN {
 
 	for i := range clone.bHidden {
 		clone.bHidden[i] = j.bHidden[i].Clone().(*tensor.Dense)
+	}
+
+	if j.useAttention {
+		clone.useAttention = true
+		clone.attnNumTokens = j.attnNumTokens
+		clone.attnDToken = j.attnDToken
+		clone.attnDModel = j.attnDModel
+		clone.AttentionLR = j.AttentionLR
+		clone.wQ = j.wQ.Clone().(*tensor.Dense)
+		clone.wK = j.wK.Clone().(*tensor.Dense)
+		clone.wV = j.wV.Clone().(*tensor.Dense)
+		clone.wO = j.wO.Clone().(*tensor.Dense)
+		clone.bQ = j.bQ.Clone().(*tensor.Dense)
+		clone.bK = j.bK.Clone().(*tensor.Dense)
+		clone.bV = j.bV.Clone().(*tensor.Dense)
+		clone.bO = j.bO.Clone().(*tensor.Dense)
 	}
 
 	return clone
@@ -749,6 +784,9 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 					side = dominos.Right
 					card = card - 28
 				}
+				if card > 27 {
+					continue
+				}
 				if contained(uint(card)) && compatible(uint(card), side) {
 					choice.Card = uint(card)
 					choice.Side = side
@@ -765,18 +803,20 @@ func (j *JSDNN) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, erro
 
 	if !somethingFound {
 		log.Errorf("No card to play found. Max confidence: %.7f Player: %d Hand: %#v Hand2: %#v Confidences: %#v Event: %s", maxConfidence, gameEvent.Player, gameEvent.PlayerHands[gameEvent.Player], j.GetHand(), cardConfidences, gameEvent.EventType)
+		log.Errorf("Suit Left: %#v", gameEvent.BoardState.LeftSuit)
+		log.Errorf("Suit Right: %#v", gameEvent.BoardState.RightSuit)
 		hand := gameEvent.PlayerHands[gameEvent.Player]
 		for i := range hand {
-			if i > 27{
+			if i > 27 {
 				continue
 			}
 			log.Warn(" ", hand[i], " ", compatible(hand[i], "left"), " ", compatible(hand[i], "right"))
-			if compatible(hand[i], "right"){
+			if compatible(hand[i], "right") {
 				choice.Side = dominos.Right
 				choice.Card = uint(hand[i])
 			}
-			if compatible(hand[i],"left"){
-				choice.Side = dominos.Right
+			if compatible(hand[i], "left") {
+				choice.Side = dominos.Left
 				choice.Card = uint(hand[i])
 			}
 		}
@@ -801,6 +841,20 @@ func (j *JSDNN) getLearnRate(learnRates []float64, layerIndex int) float64 {
 }
 
 func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRates []float64, mask tensor.Tensor) (float64, error) {
+	// Dispatch to autograd if requested
+	if j.TrainMode == "autograd" {
+		return j.trainAutograd(x, y, learnRates, mask)
+	}
+
+	// If attention is enabled, preprocess through attention layer
+	var attnCache *attentionCache
+	if j.useAttention {
+		flat := x.Data().([]float64)
+		projected, cache := j.attentionForward(flat)
+		attnCache = cache
+		x = tensor.New(tensor.WithShape(len(projected)), tensor.WithBacking(projected))
+	}
+
 	err := x.Reshape(x.Shape()[0], 1)
 	if err != nil {
 		log.Fatal(err, " ", "x")
@@ -1164,6 +1218,14 @@ func (j *JSDNN) train(x, y tensor.Tensor, gameEvent *dominos.GameEvent, learnRat
 
 	}
 
+	// Backprop through attention if enabled
+	if j.useAttention && attnCache != nil {
+		// hErrs holds dLoss/d(MLP_input) which is dLoss/d(attention_output)
+		hErrsData := hErrs.Data().([]float64)
+		attnLR := j.AttentionLR
+		j.attentionBackward(hErrsData, attnCache, attnLR)
+	}
+
 	return cost, nil
 }
 
@@ -1237,6 +1299,36 @@ func (j *JSDNN) Save(fileName string) error {
 		return err
 	}
 
+	// Encode attention data
+	err = enc.Encode(j.useAttention)
+	if err != nil {
+		return err
+	}
+	if j.useAttention {
+		err = enc.Encode(j.attnNumTokens)
+		if err != nil {
+			return err
+		}
+		err = enc.Encode(j.attnDToken)
+		if err != nil {
+			return err
+		}
+		err = enc.Encode(j.attnDModel)
+		if err != nil {
+			return err
+		}
+		err = enc.Encode(j.AttentionLR)
+		if err != nil {
+			return err
+		}
+		for _, w := range []*tensor.Dense{j.wQ, j.wK, j.wV, j.wO, j.bQ, j.bK, j.bV, j.bO} {
+			err = enc.Encode(w)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1270,6 +1362,42 @@ func (j *JSDNN) Load(fileName string) error {
 	err = dec.Decode(&j.bFinal)
 	if err != nil {
 		return err
+	}
+
+	// Try to decode attention data (backward compatible with old saves)
+	var useAttn bool
+	err = dec.Decode(&useAttn)
+	if err != nil {
+		// EOF or decode error means old format without attention — that's fine
+		return nil
+	}
+	j.useAttention = useAttn
+	if useAttn {
+		err = dec.Decode(&j.attnNumTokens)
+		if err != nil {
+			return fmt.Errorf("load attention numTokens: %w", err)
+		}
+		err = dec.Decode(&j.attnDToken)
+		if err != nil {
+			return fmt.Errorf("load attention dToken: %w", err)
+		}
+		err = dec.Decode(&j.attnDModel)
+		if err != nil {
+			return fmt.Errorf("load attention dModel: %w", err)
+		}
+		err = dec.Decode(&j.AttentionLR)
+		if err != nil {
+			return fmt.Errorf("load attention LR: %w", err)
+		}
+		attnWeights := [8]**tensor.Dense{&j.wQ, &j.wK, &j.wV, &j.wO, &j.bQ, &j.bK, &j.bV, &j.bO}
+		for _, wp := range attnWeights {
+			err = dec.Decode(wp)
+			if err != nil {
+				return fmt.Errorf("load attention weight: %w", err)
+			}
+		}
+		// Update inputDim to match attention output
+		j.inputDim = j.attnNumTokens * j.attnDModel
 	}
 
 	return nil
