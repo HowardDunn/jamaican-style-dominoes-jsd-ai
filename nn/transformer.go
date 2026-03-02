@@ -52,6 +52,12 @@ type SequenceTransformer struct {
 	OutputActivation string // "linear" (default)
 	TotalWins        int
 	TotalWins2       int
+
+	// PlayerRotation is the original player index used to rotate history
+	// player IDs so they are relative to the current player's perspective.
+	// Set this before calling TrainSupervised or Predict in supervised training.
+	// Default 0 means no rotation (correct for reinforced/online play).
+	PlayerRotation int
 }
 
 // NewSequenceTransformer creates a new transformer with the given architecture.
@@ -248,6 +254,7 @@ func (t *SequenceTransformer) UpdatePassMemory(gameEvent *dominos.GameEvent) {
 
 // PlayCard implements the Player interface for game play.
 func (t *SequenceTransformer) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (uint, dominos.BoardSide) {
+	t.PlayerRotation = int(gameEvent.Player)
 	gameEvent = jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
 
 	// Epsilon-greedy exploration

@@ -273,6 +273,7 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 						transformer.ObserveEvent(gameEvent)
 						continue
 					}
+					transformer.PlayerRotation = int(gameEvent.Player)
 					cardChoice, err := transformer.Predict(rotatedGameEvent)
 					if err != nil {
 						log.Fatal("Error predicting: ", err)
@@ -343,6 +344,7 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 						transformer.ObserveEvent(gameEvent)
 						continue
 					}
+					transformer.PlayerRotation = int(gameEvent.Player)
 					cost, err := transformer.TrainSupervised(rotatedGameEvent, learnRate)
 					if err != nil {
 						log.Fatal("Error training: ", err)

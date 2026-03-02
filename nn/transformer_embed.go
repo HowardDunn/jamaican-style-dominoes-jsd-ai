@@ -142,8 +142,11 @@ func (t *SequenceTransformer) buildSequenceFromGameEvent(gameEvent *dominos.Game
 		sideID:   sidePass,
 	})
 
-	// History tokens
+	// History tokens (rotate player IDs to be relative to current player)
 	for _, histTok := range t.gameHistory {
+		if t.PlayerRotation != 0 {
+			histTok.playerID = (histTok.playerID - t.PlayerRotation + 4) % 4
+		}
 		tokens = append(tokens, histTok)
 	}
 
