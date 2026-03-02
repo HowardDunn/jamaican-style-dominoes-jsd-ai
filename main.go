@@ -122,7 +122,7 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 	}
 	log.Infof("Loaded meta: %d iterations, %d games already trained on", meta.Iterations, len(seenGameIDs))
 
-	// Connect to MongoDB and fetch game data
+	// Connect to MongoDB and start downloading games in background
 	log.Info("Connecting to MongoDB...")
 	client, err := mongodb.Connect(mongoURI)
 	if err != nil {
@@ -135,20 +135,13 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 	}
 	log.Info("MongoDB connected successfully")
 
-	count, err := client.GameCount(gameMode)
-	if err != nil {
-		log.Fatal("Failed to count games: ", err)
-	}
-	log.Infof("Found %d games in MongoDB (mode: %s)", count, gameMode)
+	// Start download in background immediately
+	gameCh, errCh := client.FetchGamesChan(gameMode)
 
-	docs, err := client.FetchGames(gameMode)
-	if err != nil {
-		log.Fatal("Failed to fetch games: ", err)
-	}
-
+	// Collect games as they stream in, filtering out already-seen ones
 	skipped := 0
-	gameCaches := make([]*gameCache, 0, len(docs))
-	for _, doc := range docs {
+	gameCaches := []*gameCache{}
+	for doc := range gameCh {
 		if len(doc.GameEvents) == 0 {
 			continue
 		}
@@ -162,6 +155,9 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 			GameType:   doc.GameType,
 			TimeCreate: doc.TimeCreate,
 		})
+	}
+	if fetchErr := <-errCh; fetchErr != nil {
+		log.Fatal("Failed to fetch games: ", fetchErr)
 	}
 	log.Infof("Loaded %d new games from MongoDB (%d skipped as already trained)", len(gameCaches), skipped)
 

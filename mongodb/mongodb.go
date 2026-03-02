@@ -102,3 +102,54 @@ func (c *Client) FetchGames(gameType string) ([]*GameDocument, error) {
 	log.Infof("Fetched %d games from MongoDB (filter: %s)", len(docs), gameType)
 	return docs, nil
 }
+
+// FetchGamesChan starts downloading games in the background and streams them
+// through a channel. The caller can begin processing while the download continues.
+// The error channel receives at most one error (or is closed on success).
+func (c *Client) FetchGamesChan(gameType string) (<-chan *GameDocument, <-chan error) {
+	ch := make(chan *GameDocument, 64)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(ch)
+		defer close(errCh)
+
+		col := c.mongo.Database(dbName).Collection(gamesCollName)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		filter := bson.M{}
+		if gameType != "" {
+			filter["gameType"] = gameType
+		}
+
+		log.Info("Downloading games from MongoDB in background...")
+		cursor, err := col.Find(ctx, filter)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer cursor.Close(ctx)
+
+		count := 0
+		for cursor.Next(ctx) {
+			var doc GameDocument
+			if err := cursor.Decode(&doc); err != nil {
+				errCh <- err
+				return
+			}
+			ch <- &doc
+			count++
+			if count%100 == 0 {
+				log.Infof("  ...fetched %d games so far", count)
+			}
+		}
+		if err := cursor.Err(); err != nil {
+			errCh <- err
+			return
+		}
+		log.Infof("Download complete: %d games fetched", count)
+	}()
+
+	return ch, errCh
+}
