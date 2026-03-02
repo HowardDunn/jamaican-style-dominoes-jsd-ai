@@ -606,11 +606,12 @@ func playGame(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, seed int64) gameResu
 			roundGameEvents = append(roundGameEvents, lGE)
 		}
 
-		// Notify EventObserver players (e.g., transformer) about game events
+		// Notify EventObserver players — each gets event from its own perspective
 		if lGE.EventType == dominos.PlayedCard || lGE.EventType == dominos.Passed || lGE.EventType == dominos.PosedCard {
 			for k := 0; k < 4; k++ {
 				if obs, ok := dp[k].(nn.EventObserver); ok {
-					obs.ObserveEvent(lGE)
+					rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
+					obs.ObserveEvent(rotatedForK)
 				}
 			}
 		}
@@ -739,11 +740,12 @@ func playGamePartner(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, seed int64) g
 			roundGameEvents = append(roundGameEvents, lGE)
 		}
 
-		// Notify EventObserver players (e.g., transformer) about game events
+		// Notify EventObserver players — each gets event from its own perspective
 		if lGE.EventType == dominos.PlayedCard || lGE.EventType == dominos.Passed || lGE.EventType == dominos.PosedCard {
 			for k := 0; k < 4; k++ {
 				if obs, ok := dp[k].(nn.EventObserver); ok {
-					obs.ObserveEvent(lGE)
+					rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
+					obs.ObserveEvent(rotatedForK)
 				}
 			}
 		}
@@ -2401,11 +2403,14 @@ func playGamePartnerTransformer(dp [4]dominos.Player, tfPositions [4]*nn.Sequenc
 			roundGameEvents = append(roundGameEvents, lGE)
 		}
 
-		// Notify transformer players about game events for history tracking
+		// Notify transformer players about game events for history tracking.
+		// Each transformer gets the event rotated to its own perspective
+		// so history player IDs match what PlayCard sees.
 		if lGE.EventType == dominos.PlayedCard || lGE.EventType == dominos.Passed || lGE.EventType == dominos.PosedCard {
 			for k := 0; k < 4; k++ {
 				if tfPositions[k] != nil {
-					tfPositions[k].ObserveEvent(lGE)
+					rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
+					tfPositions[k].ObserveEvent(rotatedForK)
 				}
 			}
 		}
@@ -2476,11 +2481,12 @@ func playGamePartnerMixed(dp [4]dominos.Player, seed int64) gameResult {
 			roundGameEvents = append(roundGameEvents, lGE)
 		}
 
-		// Notify EventObserver players (e.g., transformer) about game events
+		// Notify EventObserver players — each gets event from its own perspective
 		if lGE.EventType == dominos.PlayedCard || lGE.EventType == dominos.Passed || lGE.EventType == dominos.PosedCard {
 			for k := 0; k < 4; k++ {
 				if obs, ok := dp[k].(nn.EventObserver); ok {
-					obs.ObserveEvent(lGE)
+					rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
+					obs.ObserveEvent(rotatedForK)
 				}
 			}
 		}
@@ -2902,7 +2908,7 @@ func trainReinforcedTransformer(cfg trainConfig) {
 				lastGameEvent := &dominos.GameEvent{}
 				for lastGameEvent != nil && lastGameEvent.EventType != dominos.GameWin {
 					lastGameEvent = dominosGame.AdvanceGameIteration()
-					lGE := jsdonline.CopyandRotateGameEvent(lastGameEvent, 0)
+					lGE := jsdonline.CopyandRotateGameEvent(lastGameEvent, pos)
 					if lGE.EventType == dominos.PlayedCard || lGE.EventType == dominos.Passed || lGE.EventType == dominos.PosedCard {
 						clone.ObserveEvent(lGE)
 					}
