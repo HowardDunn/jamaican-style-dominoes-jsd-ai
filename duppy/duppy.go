@@ -142,11 +142,10 @@ func GetOnlineTableList(token string) ([]*OnlineGameTable, error) {
 	return getTableList("online/list/", token)
 }
 
-func PlayGame(game *OnlineGameTable, token string) {
-	jsdAI := nn.New(126, []int{32, 32}, 56)
-	jsdAI.Search = true
-	jsdAI.SearchNum = 1000
-	err := jsdAI.Load("./results/duppy.mdl")
+func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string) {
+	jsdAI := nn.New(126, []int{128, 64}, 56)
+	jsdAI.Search = false
+	err := jsdAI.Load(modelPath)
 	if err != nil {
 		log.Error("Error: ", err)
 		panic(err)
@@ -187,7 +186,7 @@ func PlayGame(game *OnlineGameTable, token string) {
 		} else if lastGameEvent.EventType == dominos.RoundWin || lastGameEvent.EventType == dominos.RoundDraw {
 			jsdAI.ResetPassMemory()
 		} else if lastGameEvent.EventType == dominos.GameWin || g.ConnectionCount > 100 {
-			g.Reset(0, "cutthroat")
+			g.Reset(0, mode)
 			jsdAI.ResetPassMemory()
 			// for _, gameEvent := range roundGameEvents {
 			// 	if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {

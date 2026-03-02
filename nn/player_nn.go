@@ -447,6 +447,121 @@ func (j *JSDNN) ConvertCardChoiceToTensorReinforced(gameEvent *dominos.GameEvent
 	return res
 }
 
+func (j *JSDNN) ConvertCardChoiceToTensorReinforcedPartner(gameEvent *dominos.GameEvent, nextGameEvents [16]*dominos.GameEvent) tensor.Tensor {
+	// Partner-aware rewards: player 0 & 2 are partners, player 1 & 3 are partners.
+	// Partner wins are rewarded positively, partner passes are neutral,
+	// and partner playing does not break the chain.
+
+	cardChoice := [56]float64{}
+	index := gameEvent.Card
+	suitPlayed := gameEvent.BoardState.LeftSuit
+	if gameEvent.Side == dominos.Right {
+		index = index + 28
+		suitPlayed = gameEvent.BoardState.RightSuit
+	}
+	reward := 0.0
+	chainBroken := false
+	hasHardEnd := false
+	boardSuitCount := gameEvent.BoardState.CountSuit(suitPlayed)
+	handSuitCount := j.CountSuit(suitPlayed, dominos.GetCLIDominos())
+	isDouble := dominos.GetCLIDominos()[gameEvent.Card].IsDouble()
+	if boardSuitCount+handSuitCount == 6 {
+		hasHardEnd = true
+	}
+	won := false
+	wonByBlock := true
+	for i, nextEvent := range nextGameEvents {
+		if nextEvent == nil || i > 4 {
+			break
+		}
+
+		isPartner := nextEvent.Player == 2
+
+		switch nextEvent.EventType {
+		case dominos.Passed:
+			if nextEvent.Player == 0 {
+				reward = -1.0
+			} else if isPartner {
+				// Partner passing is neutral — not a win for us
+			} else if !chainBroken {
+				reward = reward + 1.0
+			}
+		case dominos.PlayedCard:
+			if nextEvent.Player != 0 && !isPartner {
+				chainBroken = true
+			}
+		case dominos.RoundWin:
+			if nextEvent.Player == 0 || isPartner {
+				reward = 7.0
+				won = true
+			} else {
+				reward = -7.0
+				wonByBlock = false
+			}
+
+			for k := 0; k < len(nextEvent.PlayerCardsRemaining); k++ {
+				if nextEvent.PlayerCardsRemaining[k] == 0 {
+					wonByBlock = false
+					break
+				}
+			}
+		case dominos.RoundDraw:
+			wonByBlock = false
+		}
+	}
+
+	if !won {
+		wonByBlock = false
+	}
+	if hasHardEnd && !won {
+		reward = -5.0
+	} else if isDouble && !won {
+		reward = reward + 3.0
+	}
+	if wonByBlock {
+		reward = reward * 1.5
+	}
+
+	// Board control bonus: count playable cards remaining after this play.
+	suit1, suit2 := dominos.GetCLIDominos()[gameEvent.Card].GetSuits()
+	newLeftSuit := gameEvent.BoardState.LeftSuit
+	newRightSuit := gameEvent.BoardState.RightSuit
+	if gameEvent.EventType == dominos.PosedCard || !gameEvent.BoardState.CardPosed {
+		newLeftSuit = suit1
+		newRightSuit = suit2
+	} else if gameEvent.Side == dominos.Left {
+		if suit1 == gameEvent.BoardState.LeftSuit {
+			newLeftSuit = suit2
+		} else {
+			newLeftSuit = suit1
+		}
+	} else {
+		if suit1 == gameEvent.BoardState.RightSuit {
+			newRightSuit = suit2
+		} else {
+			newRightSuit = suit1
+		}
+	}
+	playableCards := 0
+	for _, card := range gameEvent.PlayerHands[0] {
+		if card == gameEvent.Card || card >= 28 {
+			continue
+		}
+		cs1, cs2 := dominos.GetCLIDominos()[card].GetSuits()
+		if cs1 == newLeftSuit || cs2 == newLeftSuit || cs1 == newRightSuit || cs2 == newRightSuit {
+			playableCards++
+		}
+	}
+	reward += 0.3 * float64(playableCards)
+
+	// Normalize reward from [-7, ~12.5] to [0, 1] for stable linear output training
+	reward = (reward + 7.0) / 19.5
+
+	cardChoice[index] = reward
+	res := tensor.New(tensor.WithShape(56), tensor.WithBacking(cardChoice[:]))
+	return res
+}
+
 func (j *JSDNN) GetOutputMask(gameEvent *dominos.GameEvent) tensor.Tensor {
 	playerHandMask := [56]float64{}
 	for i := range gameEvent.PlayerHands[gameEvent.Player] {
@@ -1253,6 +1368,29 @@ func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRates []float
 		return 0.0, nil
 	}
 	y := j.ConvertCardChoiceToTensorReinforced(gameEvent, nextGameEvents)
+
+	// Build a mask: 1.0 only at the index of the action taken, 0.0 elsewhere
+	actionMask := [56]float64{}
+	actionIndex := gameEvent.Card
+	if gameEvent.Side == dominos.Right {
+		actionIndex = actionIndex + 28
+	}
+	actionMask[actionIndex] = 1.0
+	mask := tensor.New(tensor.WithShape(56), tensor.WithBacking(actionMask[:]))
+
+	return j.train(x, y, gameEvent, learnRates, mask)
+}
+
+func (j *JSDNN) TrainReinforcedPartner(gameEvent *dominos.GameEvent, learnRates []float64, nextGameEvents [16]*dominos.GameEvent) (float64, error) {
+	if gameEvent.EventType != dominos.PlayedCard && gameEvent.EventType != dominos.PosedCard {
+		return 0.0, errors.New("Invalid game event to train with")
+	}
+	x, compatL, compatR := j.ConvertGameEventToTensor(gameEvent)
+	if (compatL + compatR) == 1 {
+		log.Debug("If there is only one choice, no need to train it")
+		return 0.0, nil
+	}
+	y := j.ConvertCardChoiceToTensorReinforcedPartner(gameEvent, nextGameEvents)
 
 	// Build a mask: 1.0 only at the index of the action taken, 0.0 elsewhere
 	actionMask := [56]float64{}
