@@ -35,8 +35,11 @@ type JSDNN struct {
 	outputDim        int
 	gameType         string
 	knownNotHaves    [4]map[uint]bool
+	cardProb         [4][28]float64
+	probInitialized  bool
 	Search           bool
 	SearchNum        int
+	SearchTimeout    time.Duration
 	OutputActivation string  // "relu" or "linear"
 	Epsilon          float64 // epsilon-greedy exploration rate (0.0 = greedy, 0.1 = 10% random)
 
@@ -220,6 +223,11 @@ func (j *JSDNN) UpdatePassMemory(gameEvent *dominos.GameEvent) {
 			j.knownNotHaves[player][uint(i)] = true
 		}
 	}
+
+	// Update Bayesian card probabilities from pass
+	if j.probInitialized && gameEvent.BoardState != nil {
+		j.updateProbFromPass(player, gameEvent.BoardState.LeftSuit, gameEvent.BoardState.RightSuit)
+	}
 }
 
 func (j *JSDNN) ResetPassMemory() {
@@ -233,6 +241,8 @@ func (j *JSDNN) ResetPassMemory() {
 			j.knownNotHaves[i][uint(k)] = false
 		}
 	}
+	j.cardProb = [4][28]float64{}
+	j.probInitialized = false
 }
 
 func (j *JSDNN) ConvertGameEventToTensor(gameEvent *dominos.GameEvent) (tensor.Tensor, int, int) {
@@ -682,6 +692,9 @@ func (j *JSDNN) Clone() *JSDNN {
 		clone.bHidden[i] = j.bHidden[i].Clone().(*tensor.Dense)
 	}
 
+	clone.cardProb = j.cardProb
+	clone.probInitialized = j.probInitialized
+
 	if j.useAttention {
 		clone.useAttention = true
 		clone.attnNumTokens = j.attnNumTokens
@@ -730,7 +743,11 @@ func (j *JSDNN) PredictSearch(gameEvent *dominos.GameEvent, searchNum int, learn
 			outstandingCards = append(outstandingCards, card)
 		}
 	}
-	// Assign Cards Based on known information
+	// Assign Cards Based on known information + Bayesian probabilities
+
+	if !j.probInitialized {
+		j.initCardProbabilities(gameEvent)
+	}
 
 	randomSeed := time.Now().UnixNano()
 	rand.Seed(randomSeed)
@@ -740,7 +757,11 @@ func (j *JSDNN) PredictSearch(gameEvent *dominos.GameEvent, searchNum int, learn
 	clone2 := j.Clone()
 	clone3 := j.Clone()
 	clone4 := j.Clone()
+	deadline := time.Now().Add(j.SearchTimeout)
 	for i := 0; i < searchNum; i++ {
+		if j.SearchTimeout > 0 && time.Now().After(deadline) {
+			break
+		}
 
 		randomSeed := time.Now().UnixNano()
 		rand.Seed(randomSeed)
@@ -755,25 +776,7 @@ func (j *JSDNN) PredictSearch(gameEvent *dominos.GameEvent, searchNum int, learn
 		localGame := dominos.NewLocalGame(players, 0, j.gameType)
 		localGame.SetBoard(gameEvent.BoardState)
 		localGame.SetState(dominos.ExecutePlayerTurn)
-		rand.Shuffle(len(outstandingCards), func(i, j int) { outstandingCards[i], outstandingCards[j] = outstandingCards[j], outstandingCards[i] })
-		playerHands := [4][]uint{}
-		playerHands[0] = make([]uint, len(j.GetHand()))
-		copy(playerHands[0], j.GetHand())
-		o2 := make([]uint, len(outstandingCards))
-		copy(o2, outstandingCards)
-		for i := 1; i < 4; i++ {
-			playerHand := []uint{}
-			index := 0
-			for len(playerHand) < gameEvent.PlayerCardsRemaining[i] {
-				if !j.knownNotHaves[i][o2[index]] {
-					playerHand = append(playerHand, o2[index])
-					o2 = append(o2[:index], o2[index+1:]...)
-				} else {
-					index++
-				}
-			}
-			playerHands[i] = playerHand
-		}
+		playerHands := j.sampleOpponentHands(outstandingCards, gameEvent)
 		localGame.SetPlayerHands(playerHands)
 
 		var firstCardChoice *dominos.CardChoice

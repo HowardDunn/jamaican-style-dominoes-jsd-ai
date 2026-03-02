@@ -609,9 +609,13 @@ func playGame(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, seed int64) gameResu
 		// Notify EventObserver players — each gets event from its own perspective
 		if lGE.EventType == dominos.PlayedCard || lGE.EventType == dominos.Passed || lGE.EventType == dominos.PosedCard {
 			for k := 0; k < 4; k++ {
+				rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
 				if obs, ok := dp[k].(nn.EventObserver); ok {
-					rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
 					obs.ObserveEvent(rotatedForK)
+				}
+				// Update Bayesian card probabilities on PlayedCard
+				if lGE.EventType == dominos.PlayedCard {
+					nnPlayers[k].UpdateProbFromPlay(rotatedForK)
 				}
 			}
 		}
@@ -743,9 +747,12 @@ func playGamePartner(dp [4]dominos.Player, nnPlayers [4]*nn.JSDNN, seed int64) g
 		// Notify EventObserver players — each gets event from its own perspective
 		if lGE.EventType == dominos.PlayedCard || lGE.EventType == dominos.Passed || lGE.EventType == dominos.PosedCard {
 			for k := 0; k < 4; k++ {
+				rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
 				if obs, ok := dp[k].(nn.EventObserver); ok {
-					rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
 					obs.ObserveEvent(rotatedForK)
+				}
+				if lGE.EventType == dominos.PlayedCard {
+					nnPlayers[k].UpdateProbFromPlay(rotatedForK)
 				}
 			}
 		}
@@ -1862,7 +1869,7 @@ func trainKerasReinforced(cfg trainConfig) {
 	log.Info("Took : ", time.Now().Sub(start))
 }
 
-func duppyPlay(cfg trainConfig, modelPath string, mode string, statsPath string, arch string) {
+func duppyPlay(cfg trainConfig, modelPath string, mode string, statsPath string, arch string, search bool) {
 	token, err := duppy.UserLogin("duppy", "@ecIN)A*$Y93UhZ*")
 	if err != nil {
 		panic(err)
@@ -1882,7 +1889,7 @@ func duppyPlay(cfg trainConfig, modelPath string, mode string, statsPath string,
 		for _, table := range onlineTables {
 			if table.PlayerInvolved && table.GameState == "running" && !playedGames[table.GameID] {
 				log.Info("Playing game: ", table.GameID)
-				record := duppy.PlayGame(table, token, modelPath, mode, arch)
+				record := duppy.PlayGame(table, token, modelPath, mode, arch, search)
 				playedGames[table.GameID] = true
 
 				stats.Games = append(stats.Games, record)
@@ -2484,9 +2491,14 @@ func playGamePartnerMixed(dp [4]dominos.Player, seed int64) gameResult {
 		// Notify EventObserver players — each gets event from its own perspective
 		if lGE.EventType == dominos.PlayedCard || lGE.EventType == dominos.Passed || lGE.EventType == dominos.PosedCard {
 			for k := 0; k < 4; k++ {
+				rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
 				if obs, ok := dp[k].(nn.EventObserver); ok {
-					rotatedForK := jsdonline.CopyandRotateGameEvent(lastGameEvent, k)
 					obs.ObserveEvent(rotatedForK)
+				}
+				if lGE.EventType == dominos.PlayedCard {
+					if mlp, ok := dp[k].(*nn.JSDNN); ok {
+						mlp.UpdateProbFromPlay(rotatedForK)
+					}
 				}
 			}
 		}
@@ -3415,15 +3427,17 @@ func main() {
 	var duppyMode string
 	var duppyStatsPath string
 	var duppyArch string
+	var duppySearch bool
 	duppyCmd := &cobra.Command{
 		Use:   "duppy-play",
 		Short: "Play games online as duppy",
-		Run:   func(cmd *cobra.Command, args []string) { duppyPlay(cfg, duppyModel, duppyMode, duppyStatsPath, duppyArch) },
+		Run:   func(cmd *cobra.Command, args []string) { duppyPlay(cfg, duppyModel, duppyMode, duppyStatsPath, duppyArch, duppySearch) },
 	}
 	duppyCmd.Flags().StringVar(&duppyModel, "model", "duppy.mdl", "path to model file")
 	duppyCmd.Flags().StringVar(&duppyMode, "mode", "cutthroat", "game mode (cutthroat or partner)")
 	duppyCmd.Flags().StringVar(&duppyStatsPath, "stats", "duppy_stats.json", "path to stats JSON file")
 	duppyCmd.Flags().StringVar(&duppyArch, "arch", "mlp", "model architecture (mlp or transformer)")
+	duppyCmd.Flags().BoolVar(&duppySearch, "predictive-search", false, "enable predictive search during play")
 
 	var mongoURI string
 	rootCmd.PersistentFlags().StringVar(&mongoURI, "mongo-uri", "", "MongoDB connection URI (default: production)")

@@ -191,7 +191,7 @@ type duppyAI interface {
 	Load(fileName string) error
 }
 
-func loadModel(arch string, modelPath string) duppyAI {
+func loadModel(arch string, modelPath string, search bool) duppyAI {
 	switch arch {
 	case "transformer":
 		t := nn.NewSequenceTransformer(64, 2, 2, 128, 40, 56)
@@ -202,7 +202,11 @@ func loadModel(arch string, modelPath string) duppyAI {
 		return t
 	default:
 		m := nn.New(126, []int{128, 64}, 56)
-		m.Search = false
+		m.Search = search
+		if search {
+			m.SearchNum = 100
+			m.SearchTimeout = 7 * time.Second
+		}
 		if err := m.Load(modelPath); err != nil {
 			log.Error("Error loading mlp: ", err)
 			panic(err)
@@ -211,8 +215,8 @@ func loadModel(arch string, modelPath string) duppyAI {
 	}
 }
 
-func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string, arch string) DuppyGameRecord {
-	jsdAI := loadModel(arch, modelPath)
+func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string, arch string, search bool) DuppyGameRecord {
+	jsdAI := loadModel(arch, modelPath, search)
 	// If it's a transformer, also observe events for sequence context
 	observer, hasObserver := jsdAI.(nn.EventObserver)
 
@@ -272,9 +276,17 @@ func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string
 				Timestamp: time.Now(),
 			}
 			return record
-		} else if hasObserver {
-			// Feed all other events (PlayedCard, PosedCard from other players) to transformer
-			observer.ObserveEvent(lastGameEvent)
+		} else {
+			// Feed all other events (PlayedCard, PosedCard from other players)
+			if hasObserver {
+				observer.ObserveEvent(lastGameEvent)
+			}
+			// Update Bayesian card probabilities on opponent PlayedCard
+			if lastGameEvent.EventType == dominos.PlayedCard {
+				if mlp, ok := jsdAI.(*nn.JSDNN); ok {
+					mlp.UpdateProbFromPlay(lastGameEvent)
+				}
+			}
 		}
 
 		time.Sleep(300 * time.Millisecond)
