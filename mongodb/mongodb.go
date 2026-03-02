@@ -140,7 +140,7 @@ func (c *Client) FetchGamesChan(gameType string) (<-chan *GameDocument, <-chan e
 			}
 			ch <- &doc
 			count++
-			if count%100 == 0 {
+			if count%5 == 0 {
 				log.Infof("  ...fetched %d games so far", count)
 			}
 		}
