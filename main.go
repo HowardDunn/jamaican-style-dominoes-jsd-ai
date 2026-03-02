@@ -1665,13 +1665,15 @@ func trainKerasReinforced(cfg trainConfig) {
 	log.Info("Took : ", time.Now().Sub(start))
 }
 
-func duppyPlay(cfg trainConfig, modelPath string, mode string) {
+func duppyPlay(cfg trainConfig, modelPath string, mode string, statsPath string) {
 	token, err := duppy.UserLogin("duppy", "@ecIN)A*$Y93UhZ*")
 	if err != nil {
 		panic(err)
 	}
+	stats := duppy.LoadStats(statsPath)
+	log.Infof("Loaded stats: %d games played, %d won (%.1f%%)", stats.GamesPlayed, stats.GamesWon, stats.GameWinPct)
+
 	joinedGame := false
-	gamesPlayed := 0
 	playedGames := map[string]bool{}
 	for {
 		onlineTables, err := duppy.GetOnlineTableList(token)
@@ -1683,10 +1685,30 @@ func duppyPlay(cfg trainConfig, modelPath string, mode string) {
 		for _, table := range onlineTables {
 			if table.PlayerInvolved && table.GameState == "running" && !playedGames[table.GameID] {
 				log.Info("Playing game: ", table.GameID)
-				duppy.PlayGame(table, token, modelPath, mode)
-				gamesPlayed++
+				record := duppy.PlayGame(table, token, modelPath, mode)
 				playedGames[table.GameID] = true
-				log.Info("Finished playing game: ", table.GameID, " Num Played: ", gamesPlayed)
+
+				stats.Games = append(stats.Games, record)
+				stats.GamesPlayed++
+				if record.DuppyWon {
+					stats.GamesWon++
+				}
+				for i := 0; i < 4; i++ {
+					stats.TotalRounds += record.RoundWins[i]
+				}
+				stats.RoundsWon += record.RoundWins[0]
+				if stats.GamesPlayed > 0 {
+					stats.GameWinPct = float64(stats.GamesWon) / float64(stats.GamesPlayed) * 100
+				}
+				if stats.TotalRounds > 0 {
+					stats.RoundWinPct = float64(stats.RoundsWon) / float64(stats.TotalRounds) * 100
+				}
+				if err := duppy.SaveStats(statsPath, stats); err != nil {
+					log.Error("Failed to save stats: ", err)
+				}
+				log.Infof("Game %d done | won=%v | rounds=%v | game-win%%=%.1f | round-win%%=%.1f",
+					stats.GamesPlayed, record.DuppyWon, record.RoundWins, stats.GameWinPct, stats.RoundWinPct)
+
 				joinedGame = false
 				onlineTables = []*duppy.OnlineGameTable{}
 				break
@@ -3190,13 +3212,15 @@ func main() {
 
 	var duppyModel string
 	var duppyMode string
+	var duppyStatsPath string
 	duppyCmd := &cobra.Command{
 		Use:   "duppy-play",
 		Short: "Play games online as duppy",
-		Run:   func(cmd *cobra.Command, args []string) { duppyPlay(cfg, duppyModel, duppyMode) },
+		Run:   func(cmd *cobra.Command, args []string) { duppyPlay(cfg, duppyModel, duppyMode, duppyStatsPath) },
 	}
 	duppyCmd.Flags().StringVar(&duppyModel, "model", "duppy.mdl", "path to model file")
 	duppyCmd.Flags().StringVar(&duppyMode, "mode", "cutthroat", "game mode (cutthroat or partner)")
+	duppyCmd.Flags().StringVar(&duppyStatsPath, "stats", "duppy_stats.json", "path to stats JSON file")
 
 	rootCmd.AddCommand(
 		&cobra.Command{

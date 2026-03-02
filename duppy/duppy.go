@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -20,6 +21,45 @@ const (
 	jsdUrl   = "https://api.jamaicanstyledominoes.com/"
 	wsJSDUrl = "wss://api.jamaicanstyledominoes.com/"
 )
+
+type DuppyGameRecord struct {
+	GameID    string    `json:"game_id"`
+	Mode      string    `json:"game_mode"`
+	Players   [4]string `json:"players"`
+	RoundWins [4]int    `json:"round_wins"`
+	DuppyWon  bool      `json:"duppy_won"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type DuppyStats struct {
+	GamesPlayed int                `json:"games_played"`
+	GamesWon    int                `json:"games_won"`
+	GameWinPct  float64            `json:"game_win_pct"`
+	RoundsWon   int                `json:"rounds_won"`
+	TotalRounds int                `json:"total_rounds"`
+	RoundWinPct float64            `json:"round_win_pct"`
+	Games       []DuppyGameRecord  `json:"games"`
+}
+
+func LoadStats(path string) DuppyStats {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return DuppyStats{}
+	}
+	var stats DuppyStats
+	if err := json.Unmarshal(data, &stats); err != nil {
+		return DuppyStats{}
+	}
+	return stats
+}
+
+func SaveStats(path string, stats DuppyStats) error {
+	data, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
 
 var userData map[string]interface{}
 
@@ -142,7 +182,7 @@ func GetOnlineTableList(token string) ([]*OnlineGameTable, error) {
 	return getTableList("online/list/", token)
 }
 
-func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string) {
+func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string) DuppyGameRecord {
 	jsdAI := nn.New(126, []int{128, 64}, 56)
 	jsdAI.Search = false
 	err := jsdAI.Load(modelPath)
@@ -188,27 +228,27 @@ func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string
 		} else if lastGameEvent.EventType == dominos.GameWin || g.ConnectionCount > 100 {
 			g.Reset(0, mode)
 			jsdAI.ResetPassMemory()
-			// for _, gameEvent := range roundGameEvents {
-			// 	if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {
-			// 		rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
-			// 		_, err := jsdAI.TrainReinforced(rotatedGameEvent, 0.001, lastGameEvent)
-			// 		if err != nil {
-			// 			log.Error("Error training: ", err)
-			// 			return
-			// 		}
-			// 	} else if gameEvent.EventType == dominos.Passed {
-			// 		jsdAI.UpdatePassMemory(gameEvent)
-			// 	} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
-			// 		jsdAI.ResetPassMemory()
-			// 	}
-			// }
-			// roundGameEvents = []*dominos.GameEvent{}
-			// jsdAI.Save("duppy2.mdl")
-			return
+			record := DuppyGameRecord{
+				GameID:    game.GameID,
+				Mode:      mode,
+				Players:   lastGameEvent.PlayerNames,
+				RoundWins: lastGameEvent.PlayerWins,
+				DuppyWon:  lastGameEvent.PlayerWins[0] >= 6,
+				Timestamp: time.Now(),
+			}
+			return record
 		}
 
 		time.Sleep(300 * time.Millisecond)
 
+	}
+	return DuppyGameRecord{
+		GameID:    game.GameID,
+		Mode:      mode,
+		Players:   lastGameEvent.PlayerNames,
+		RoundWins: lastGameEvent.PlayerWins,
+		DuppyWon:  lastGameEvent.PlayerWins[0] >= 6,
+		Timestamp: time.Now(),
 	}
 }
 
