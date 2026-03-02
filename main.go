@@ -403,6 +403,7 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 	p.Title.Text = "Cost vs iteration"
 	p.X.Label.Text = "iteration"
 	p.Y.Label.Text = "Cost"
+	var err error
 	err = plotutil.AddLinePoints(p, "JSD", pts)
 	if err != nil {
 		log.Fatal(err)
