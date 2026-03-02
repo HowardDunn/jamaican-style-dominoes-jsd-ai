@@ -23,10 +23,11 @@ type Client struct {
 }
 
 type GameDocument struct {
-	UUID       string               `bson:"uuid"`
-	GameType   string               `bson:"gameType"`
-	GameEvents []*dominos.GameEvent `bson:"gameEvents"`
-	TimeCreate time.Time            `bson:"timeCreated"`
+	UUID        string               `bson:"uuid"`
+	GameType    string               `bson:"gameType"`
+	GameEvents  []*dominos.GameEvent `bson:"gameEvents"`
+	GameQuality float64              `bson:"gameQuality"`
+	TimeCreate  time.Time            `bson:"timeCreated"`
 }
 
 func Connect(uri string) (*Client, error) {

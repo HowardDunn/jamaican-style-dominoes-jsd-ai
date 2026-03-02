@@ -504,7 +504,13 @@ func (t *SequenceTransformer) Predict(gameEvent *dominos.GameEvent) (*dominos.Ca
 	}
 
 	if !found {
-		return &dominos.CardChoice{Card: hand[0], Side: dominos.Left}, nil
+		// Fallback: pick first valid card in hand
+		for _, c := range hand {
+			if c < 28 {
+				return &dominos.CardChoice{Card: c, Side: dominos.Left}, nil
+			}
+		}
+		return &dominos.CardChoice{Card: 0, Side: dominos.Left}, nil
 	}
 
 	return &dominos.CardChoice{Card: bestCard, Side: bestSide}, nil
