@@ -1628,7 +1628,9 @@ func (j *JSDNN) PlayCard(gameEvent *dominos.GameEvent, doms []dominos.Domino) (u
 
 	choices := compatL + compatR
 	typ := "predict"
-	if j.Search && choices > 1 && gameEvent.PlayerCardsRemaining[0] < 5 {
+	if j.Search && choices > 1 && (j.SearchTimeout > 0 || gameEvent.PlayerCardsRemaining[0] < 5) {
+		log.Infof("PredictSearch: cards=%d choices=%d searchNum=%d timeout=%s",
+			gameEvent.PlayerCardsRemaining[0], choices, j.SearchNum, j.SearchTimeout)
 		cardChoiceSearch, probability, err := j.PredictSearch(gameEvent, j.SearchNum, 0.001)
 		if err != nil {
 			log.Warn("Error predicting Search using AI")
