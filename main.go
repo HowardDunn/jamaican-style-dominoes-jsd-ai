@@ -87,7 +87,7 @@ func userIn(users []string, filteredUsers map[string]any) bool {
 	return false
 }
 
-func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode string) {
+func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode string, filterUser string) {
 	path := cfg.resultsPath(time.Now().Format(time.RFC3339))
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		err := os.Mkdir(path, 0o644)
@@ -98,8 +98,15 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 
 	// variables
 	learnRate := 0.0005
-	filteredUsers := map[string]any{"deigodon201": nil}
-	filterUsers := true
+	filteredUsers := map[string]any{}
+	filterUsers := false
+	if filterUser != "" {
+		filteredUsers[filterUser] = nil
+		filterUsers = true
+		log.Infof("Filtering training to user: %s", filterUser)
+	} else {
+		log.Info("Training on all players")
+	}
 	epochs := 5
 
 	// Create transformer model (same architecture as trainReinforcedTransformer)
@@ -3376,13 +3383,15 @@ func main() {
 
 	var humanModelName string
 	var humanGameMode string
+	var humanFilterUser string
 	trainHumanCmd := &cobra.Command{
 		Use:   "train-human",
 		Short: "Train on human game data from MongoDB",
-		Run:   func(cmd *cobra.Command, args []string) { trainHuman(cfg, humanModelName, mongoURI, humanGameMode) },
+		Run:   func(cmd *cobra.Command, args []string) { trainHuman(cfg, humanModelName, mongoURI, humanGameMode, humanFilterUser) },
 	}
 	trainHumanCmd.Flags().StringVar(&humanModelName, "model", "human_trained.mdl", "output model filename")
 	trainHumanCmd.Flags().StringVar(&humanGameMode, "game-mode", "", "filter by game mode (partner, cutthroat, or empty for all)")
+	trainHumanCmd.Flags().StringVar(&humanFilterUser, "filter-user", "", "only train on games involving this username (empty = all players)")
 
 	rootCmd.AddCommand(
 		&cobra.Command{
