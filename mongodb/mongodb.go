@@ -69,7 +69,7 @@ func (c *Client) GameCount(gameType string) (int64, error) {
 
 func (c *Client) FetchGames(gameType string) ([]*GameDocument, error) {
 	col := c.mongo.Database(dbName).Collection(gamesCollName)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	filter := bson.M{}
@@ -77,6 +77,7 @@ func (c *Client) FetchGames(gameType string) ([]*GameDocument, error) {
 		filter["gameType"] = gameType
 	}
 
+	log.Info("Downloading games from MongoDB (this may take a few minutes)...")
 	cursor, err := col.Find(ctx, filter)
 	if err != nil {
 		return nil, err
@@ -84,7 +85,17 @@ func (c *Client) FetchGames(gameType string) ([]*GameDocument, error) {
 	defer cursor.Close(ctx)
 
 	var docs []*GameDocument
-	if err := cursor.All(ctx, &docs); err != nil {
+	for cursor.Next(ctx) {
+		var doc GameDocument
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, err
+		}
+		docs = append(docs, &doc)
+		if len(docs)%100 == 0 {
+			log.Infof("  ...fetched %d games so far", len(docs))
+		}
+	}
+	if err := cursor.Err(); err != nil {
 		return nil, err
 	}
 
