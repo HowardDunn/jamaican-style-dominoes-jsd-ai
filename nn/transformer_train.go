@@ -2,6 +2,7 @@ package nn
 
 import (
 	"errors"
+	"math"
 
 	"github.com/HowardDunn/go-dominos/dominos"
 	jsdonline "github.com/HowardDunn/jsd-online-game/game"
@@ -380,21 +381,38 @@ func (t *SequenceTransformer) GetGameHistory() []moveToken {
 	return t.gameHistory
 }
 
+// softmax computes softmax over a 1D slice of logits (numerically stable).
+func softmax(logits []float64) []float64 {
+	n := len(logits)
+	out := make([]float64, n)
+	max := logits[0]
+	for _, v := range logits[1:] {
+		if v > max {
+			max = v
+		}
+	}
+	sum := 0.0
+	for i, v := range logits {
+		out[i] = math.Exp(v - max)
+		sum += out[i]
+	}
+	for i := range out {
+		out[i] /= sum
+	}
+	return out
+}
+
 // TrainSupervised trains the transformer on a single game event using supervised learning.
-// The target is a one-hot vector: 1.0 at the index of the human's actual move.
-// The gradient is computed across all 56 outputs (full cross-entropy style).
+// Uses softmax + cross-entropy loss. The gradient is (softmax_prob - one_hot_target).
 func (t *SequenceTransformer) TrainSupervised(gameEvent *dominos.GameEvent, learnRate float64) (float64, error) {
 	if gameEvent.EventType != dominos.PlayedCard && gameEvent.EventType != dominos.PosedCard {
 		return 0.0, errors.New("invalid game event to train with")
 	}
 
-	// Build one-hot target
-	var target [56]float64
 	actionIndex := int(gameEvent.Card)
 	if gameEvent.Side == dominos.Right {
 		actionIndex += 28
 	}
-	target[actionIndex] = 1.0
 
 	// Build the token sequence
 	tokens := t.buildSequenceFromGameEvent(gameEvent)
@@ -402,36 +420,42 @@ func (t *SequenceTransformer) TrainSupervised(gameEvent *dominos.GameEvent, lear
 		return 0.0, nil
 	}
 
-	// Forward pass
-	output, cache := t.forward(tokens)
+	// Forward pass (raw logits)
+	logits, cache := t.forward(tokens)
 
-	// Compute gradient across all outputs (target - output)
+	// Softmax
+	probs := softmax(logits)
+
+	// Cross-entropy loss: -log(prob[correct_class])
+	cost := -math.Log(math.Max(probs[actionIndex], 1e-12))
+
+	// Gradient of cross-entropy w.r.t. logits = prob - target
+	// For softmax+CE this is simply: grad[i] = prob[i], grad[correct] = prob[correct] - 1
+	// We negate because backward() expects (target - output) direction
 	outputGrad := make([]float64, t.outputDim)
-	cost := 0.0
 	for i := 0; i < t.outputDim; i++ {
-		e := target[i] - output[i]
-		e = clipValue(e)
-		outputGrad[i] = e
-		cost += e * e
+		outputGrad[i] = -probs[i]
 	}
+	outputGrad[actionIndex] = 1.0 - probs[actionIndex]
 
 	// Backward pass
 	t.backward(outputGrad, cache, learnRate)
 
-	return cost / float64(t.outputDim), nil
+	return cost, nil
 }
 
-// Predict runs the transformer forward pass and returns the best valid card choice.
+// Predict runs the transformer forward pass with softmax and returns the best valid card choice.
 func (t *SequenceTransformer) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, error) {
 	tokens := t.buildSequenceFromGameEvent(gameEvent)
 	if len(tokens) == 0 {
 		return nil, errors.New("empty token sequence")
 	}
 
-	output, _ := t.forward(tokens)
+	logits, _ := t.forward(tokens)
+	probs := softmax(logits)
 	doms := dominos.GetCLIDominos()
 
-	maxConf := -1e18
+	maxProb := -1.0
 	bestCard := uint(0)
 	bestSide := dominos.Left
 	found := false
@@ -446,7 +470,7 @@ func (t *SequenceTransformer) Predict(gameEvent *dominos.GameEvent) (*dominos.Ca
 		return false
 	}
 
-	for i, conf := range output {
+	for i, prob := range probs {
 		side := dominos.Left
 		card := i
 		if i >= 28 {
@@ -471,8 +495,8 @@ func (t *SequenceTransformer) Predict(gameEvent *dominos.GameEvent) (*dominos.Ca
 				}
 			}
 		}
-		if conf > maxConf {
-			maxConf = conf
+		if prob > maxProb {
+			maxProb = prob
 			bestCard = uint(card)
 			bestSide = side
 			found = true
