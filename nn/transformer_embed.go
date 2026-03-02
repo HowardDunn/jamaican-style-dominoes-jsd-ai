@@ -4,7 +4,6 @@ import (
 	"math"
 
 	"github.com/HowardDunn/go-dominos/dominos"
-	jsdonline "github.com/HowardDunn/jsd-online-game/game"
 )
 
 // Token vocabulary constants
@@ -170,9 +169,7 @@ func (t *SequenceTransformer) observeGameEvent(gameEvent *dominos.GameEvent) {
 		return
 	}
 
-	// Rotate to our perspective
-	rotated := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
-	player := rotated.Player
+	player := int(gameEvent.Player)
 
 	switch gameEvent.EventType {
 	case dominos.PlayedCard:
