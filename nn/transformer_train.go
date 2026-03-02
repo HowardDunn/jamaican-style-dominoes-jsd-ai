@@ -380,6 +380,112 @@ func (t *SequenceTransformer) GetGameHistory() []moveToken {
 	return t.gameHistory
 }
 
+// TrainSupervised trains the transformer on a single game event using supervised learning.
+// The target is a one-hot vector: 1.0 at the index of the human's actual move.
+// The gradient is computed across all 56 outputs (full cross-entropy style).
+func (t *SequenceTransformer) TrainSupervised(gameEvent *dominos.GameEvent, learnRate float64) (float64, error) {
+	if gameEvent.EventType != dominos.PlayedCard && gameEvent.EventType != dominos.PosedCard {
+		return 0.0, errors.New("invalid game event to train with")
+	}
+
+	// Build one-hot target
+	var target [56]float64
+	actionIndex := int(gameEvent.Card)
+	if gameEvent.Side == dominos.Right {
+		actionIndex += 28
+	}
+	target[actionIndex] = 1.0
+
+	// Build the token sequence
+	tokens := t.buildSequenceFromGameEvent(gameEvent)
+	if len(tokens) == 0 {
+		return 0.0, nil
+	}
+
+	// Forward pass
+	output, cache := t.forward(tokens)
+
+	// Compute gradient across all outputs (target - output)
+	outputGrad := make([]float64, t.outputDim)
+	cost := 0.0
+	for i := 0; i < t.outputDim; i++ {
+		e := target[i] - output[i]
+		e = clipValue(e)
+		outputGrad[i] = e
+		cost += e * e
+	}
+
+	// Backward pass
+	t.backward(outputGrad, cache, learnRate)
+
+	return cost / float64(t.outputDim), nil
+}
+
+// Predict runs the transformer forward pass and returns the best valid card choice.
+func (t *SequenceTransformer) Predict(gameEvent *dominos.GameEvent) (*dominos.CardChoice, error) {
+	tokens := t.buildSequenceFromGameEvent(gameEvent)
+	if len(tokens) == 0 {
+		return nil, errors.New("empty token sequence")
+	}
+
+	output, _ := t.forward(tokens)
+	doms := dominos.GetCLIDominos()
+
+	maxConf := -1e18
+	bestCard := uint(0)
+	bestSide := dominos.Left
+	found := false
+
+	hand := gameEvent.PlayerHands[gameEvent.Player]
+	contained := func(card uint) bool {
+		for _, h := range hand {
+			if h == card {
+				return true
+			}
+		}
+		return false
+	}
+
+	for i, conf := range output {
+		side := dominos.Left
+		card := i
+		if i >= 28 {
+			side = dominos.Right
+			card -= 28
+		}
+		if card >= 28 {
+			continue
+		}
+		if !contained(uint(card)) {
+			continue
+		}
+		if gameEvent.BoardState != nil && gameEvent.BoardState.CardPosed {
+			suit1, suit2 := doms[card].GetSuits()
+			if side == dominos.Left {
+				if suit1 != gameEvent.BoardState.LeftSuit && suit2 != gameEvent.BoardState.LeftSuit {
+					continue
+				}
+			} else {
+				if suit1 != gameEvent.BoardState.RightSuit && suit2 != gameEvent.BoardState.RightSuit {
+					continue
+				}
+			}
+		}
+		if conf > maxConf {
+			maxConf = conf
+			bestCard = uint(card)
+			bestSide = side
+			found = true
+		}
+	}
+
+	if !found {
+		return &dominos.CardChoice{Card: hand[0], Side: dominos.Left}, nil
+	}
+
+	return &dominos.CardChoice{Card: bestCard, Side: bestSide}, nil
+}
+
 // ConvertGameEventToHistoryTokens converts round events up to a given index into history tokens.
 // This is used to reconstruct the history state at each training point.
 func ConvertRoundEventsToHistory(roundGameEvents []*dominos.GameEvent, upToIndex int) []moveToken {

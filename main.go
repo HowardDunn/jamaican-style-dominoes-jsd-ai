@@ -14,6 +14,7 @@ import (
 
 	"github.com/HowardDunn/go-dominos/dominos"
 	"github.com/HowardDunn/jsd-ai/duppy"
+	"github.com/HowardDunn/jsd-ai/mongodb"
 	"github.com/HowardDunn/jsd-ai/nn"
 	jsdonline "github.com/HowardDunn/jsd-online-game/game"
 	"github.com/schollz/progressbar/v3"
@@ -47,6 +48,7 @@ func (c trainConfig) resultsPath(name string) string {
 }
 
 type gameCache struct {
+	UUID       string               `bson:"uuid", json:"uuid"`
 	GameEvents []*dominos.GameEvent `bson:"gameEvents", json:"gameEvents"`
 	GameType   string               `bson:"gameType", json:"gameType"`
 	TimeCreate time.Time            `bson:"timeCreated", json:"timeCreated"`
@@ -85,7 +87,7 @@ func userIn(users []string, filteredUsers map[string]any) bool {
 	return false
 }
 
-func trainHuman(cfg trainConfig) {
+func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode string) {
 	path := cfg.resultsPath(time.Now().Format(time.RFC3339))
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		err := os.Mkdir(path, 0o644)
@@ -95,18 +97,73 @@ func trainHuman(cfg trainConfig) {
 	}
 
 	// variables
-	learnRate := 0.001
+	learnRate := 0.0005
 	filteredUsers := map[string]any{"deigodon201": nil}
 	filterUsers := true
 	epochs := 5
 
-	jsdai := nn.New(126, []int{204, 102}, 56)
-	r := make([]float64, 96)
-	nn.FillRandom(r, float64(len(r)))
+	// Create transformer model (same architecture as trainReinforcedTransformer)
+	transformer := nn.NewSequenceTransformer(64, 2, 2, 128, 40, 56)
 
-	gameCaches := LoadData("./data/games_partner.json")
-	// gameCaches := LoadData("./data/ozark.games.json")
-	log.Info("Successfully Loaded data")
+	// Try loading existing model and metadata
+	modelPath := cfg.resultsPath(modelName)
+	metaPath := modelPath + ".meta.json"
+	if _, err := os.Stat(modelPath); err == nil {
+		if err := transformer.Load(modelPath); err != nil {
+			log.Warnf("Failed to load existing model %s: %v — starting fresh", modelPath, err)
+		} else {
+			log.Infof("Loaded existing model: %s", modelPath)
+		}
+	}
+	meta := loadHumanTrainMeta(metaPath)
+	seenGameIDs := map[string]bool{}
+	for _, id := range meta.TrainedGameIDs {
+		seenGameIDs[id] = true
+	}
+	log.Infof("Loaded meta: %d iterations, %d games already trained on", meta.Iterations, len(seenGameIDs))
+
+	// Connect to MongoDB and fetch game data
+	log.Info("Connecting to MongoDB...")
+	client, err := mongodb.Connect(mongoURI)
+	if err != nil {
+		log.Fatal("Failed to connect to MongoDB: ", err)
+	}
+	defer client.Disconnect()
+
+	if err := client.Ping(); err != nil {
+		log.Fatal("MongoDB ping failed: ", err)
+	}
+	log.Info("MongoDB connected successfully")
+
+	count, err := client.GameCount(gameMode)
+	if err != nil {
+		log.Fatal("Failed to count games: ", err)
+	}
+	log.Infof("Found %d games in MongoDB (mode: %s)", count, gameMode)
+
+	docs, err := client.FetchGames(gameMode)
+	if err != nil {
+		log.Fatal("Failed to fetch games: ", err)
+	}
+
+	skipped := 0
+	gameCaches := make([]*gameCache, 0, len(docs))
+	for _, doc := range docs {
+		if len(doc.GameEvents) == 0 {
+			continue
+		}
+		if seenGameIDs[doc.UUID] {
+			skipped++
+			continue
+		}
+		gameCaches = append(gameCaches, &gameCache{
+			UUID:       doc.UUID,
+			GameEvents: doc.GameEvents,
+			GameType:   doc.GameType,
+			TimeCreate: doc.TimeCreate,
+		})
+	}
+	log.Infof("Loaded %d new games from MongoDB (%d skipped as already trained)", len(gameCaches), skipped)
 
 	randomSeed := time.Now().UnixNano()
 	log.Info("Using random Seed: ", randomSeed)
@@ -138,14 +195,16 @@ func trainHuman(cfg trainConfig) {
 				continue
 			}
 
+			transformer.ResetHistory()
 			for _, gameEvent := range gameCache.GameEvents {
 				if gameEvent.EventType == dominos.PlayedCard {
 					rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
 					_, ok := filteredUsers[rotatedGameEvent.PlayerNames[0]]
 					if !ok && filterUsers {
+						transformer.ObserveEvent(gameEvent)
 						continue
 					}
-					cardChoice, err := jsdai.Predict(rotatedGameEvent)
+					cardChoice, err := transformer.Predict(rotatedGameEvent)
 					if err != nil {
 						log.Fatal("Error predicting: ", err)
 					}
@@ -169,16 +228,27 @@ func trainHuman(cfg trainConfig) {
 						}
 					}
 				}
+				// Update history for all events
+				transformer.ObserveEvent(gameEvent)
+				if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
+					transformer.ResetHistory()
+				}
 			}
 		}
 
-		acc := float64(accuracies) / float64(accuracies+inaccuracies)
-		log.Infof("Accuracy of validation: %.5f", float64(accuracies)/float64(accuracies+inaccuracies))
-		log.Infof("Compatible of validation data: %.5f", float64(compatibles)/float64(incompatibles+compatibles))
+		acc := 0.0
+		if accuracies+inaccuracies > 0 {
+			acc = float64(accuracies) / float64(accuracies+inaccuracies)
+		}
+		log.Infof("Accuracy of validation: %.5f", acc)
+		if compatibles+incompatibles > 0 {
+			log.Infof("Compatible of validation data: %.5f", float64(compatibles)/float64(incompatibles+compatibles))
+		}
 		return acc
 	}
 
 	averageCosts := []float64{}
+	newGameIDs := []string{}
 	train := func() {
 		bar := progressbar.Default(int64(len(trainingGames)))
 		for _, gameCache := range trainingGames {
@@ -191,26 +261,45 @@ func trainHuman(cfg trainConfig) {
 				continue
 			}
 			gameCost := []float64{}
+			transformer.ResetHistory()
 			for _, gameEvent := range gameCache.GameEvents {
 				if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {
 					rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
 					_, ok := filteredUsers[rotatedGameEvent.PlayerNames[0]]
 					if !ok && filterUsers {
+						transformer.ObserveEvent(gameEvent)
 						continue
 					}
-					cost, err := jsdai.Train(rotatedGameEvent, []float64{learnRate})
+					cost, err := transformer.TrainSupervised(rotatedGameEvent, learnRate)
 					if err != nil {
 						log.Fatal("Error training: ", err)
 					}
 					gameCost = append(gameCost, cost)
-				} else if gameEvent.EventType == dominos.Passed {
-					jsdai.UpdatePassMemory(gameEvent)
-				} else if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
-					jsdai.ResetPassMemory()
+					meta.Iterations++
+				}
+				// Update history for all events
+				transformer.ObserveEvent(gameEvent)
+				if gameEvent.EventType == dominos.RoundWin || gameEvent.EventType == dominos.RoundDraw {
+					transformer.ResetHistory()
 				}
 			}
-			averageCosts = append(averageCosts, calculateAverageSquaredCost(gameCost))
+			if len(gameCost) > 0 {
+				averageCosts = append(averageCosts, calculateAverageSquaredCost(gameCost))
+			}
+			if gameCache.UUID != "" {
+				newGameIDs = append(newGameIDs, gameCache.UUID)
+			}
 		}
+	}
+
+	saveMeta := func() {
+		meta.TrainedGameIDs = append(meta.TrainedGameIDs, newGameIDs...)
+		meta.GamesTrainedOn = len(meta.TrainedGameIDs)
+		if err := saveHumanTrainMeta(metaPath, meta); err != nil {
+			log.Error("Failed to save meta: ", err)
+		}
+		// Clear newGameIDs since they're now persisted
+		newGameIDs = nil
 	}
 
 	accuracies := []float64{}
@@ -219,6 +308,10 @@ func trainHuman(cfg trainConfig) {
 		log.Infof("Epoch: %d out of %d", i+1, epochs)
 		train()
 		accuracies = append(accuracies, evaluate())
+		// Save model and meta after each epoch
+		transformer.Save(path + modelName)
+		saveMeta()
+		log.Infof("Model + meta saved to %s (iterations: %d, games: %d)", path+modelName, meta.Iterations, meta.GamesTrainedOn)
 	}
 
 	pts := make(plotter.XYs, len(averageCosts))
@@ -237,7 +330,7 @@ func trainHuman(cfg trainConfig) {
 	p.Title.Text = "Cost vs iteration"
 	p.X.Label.Text = "iteration"
 	p.Y.Label.Text = "Cost"
-	err := plotutil.AddLinePoints(p, "JSD", pts)
+	err = plotutil.AddLinePoints(p, "JSD", pts)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -261,7 +354,9 @@ func trainHuman(cfg trainConfig) {
 		panic(err)
 	}
 
-	jsdai.Save(path + "model.mdl")
+	transformer.Save(path + modelName)
+	saveMeta()
+	log.Infof("Final model saved to %s (iterations: %d, games: %d)", path+modelName, meta.Iterations, meta.GamesTrainedOn)
 }
 
 type modelMeta struct {
@@ -335,6 +430,32 @@ func loadModelMeta(path string) modelMeta {
 		return modelMeta{}
 	}
 	return meta
+}
+
+type humanTrainMeta struct {
+	Iterations    int      `json:"iterations"`
+	GamesTrainedOn int     `json:"games_trained_on"`
+	TrainedGameIDs []string `json:"trained_game_ids"`
+}
+
+func loadHumanTrainMeta(path string) humanTrainMeta {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return humanTrainMeta{}
+	}
+	var meta humanTrainMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return humanTrainMeta{}
+	}
+	return meta
+}
+
+func saveHumanTrainMeta(path string, meta humanTrainMeta) error {
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 type h2hMeta struct {
@@ -3222,6 +3343,49 @@ func main() {
 	duppyCmd.Flags().StringVar(&duppyMode, "mode", "cutthroat", "game mode (cutthroat or partner)")
 	duppyCmd.Flags().StringVar(&duppyStatsPath, "stats", "duppy_stats.json", "path to stats JSON file")
 
+	var mongoURI string
+	rootCmd.PersistentFlags().StringVar(&mongoURI, "mongo-uri", "", "MongoDB connection URI (default: production)")
+
+	checkMongoCmd := &cobra.Command{
+		Use:   "check-mongo",
+		Short: "Test MongoDB connection and show game counts",
+		Run: func(cmd *cobra.Command, args []string) {
+			client, err := mongodb.Connect(mongoURI)
+			if err != nil {
+				log.Fatalf("Connect failed: %v", err)
+			}
+			defer client.Disconnect()
+
+			if err := client.Ping(); err != nil {
+				log.Fatalf("Ping failed: %v", err)
+			}
+			log.Info("MongoDB connection OK")
+
+			for _, mode := range []string{"", "partner", "cutthroat"} {
+				count, err := client.GameCount(mode)
+				if err != nil {
+					log.Errorf("GameCount(%s) failed: %v", mode, err)
+					continue
+				}
+				label := "all"
+				if mode != "" {
+					label = mode
+				}
+				log.Infof("Games (%s): %d", label, count)
+			}
+		},
+	}
+
+	var humanModelName string
+	var humanGameMode string
+	trainHumanCmd := &cobra.Command{
+		Use:   "train-human",
+		Short: "Train on human game data from MongoDB",
+		Run:   func(cmd *cobra.Command, args []string) { trainHuman(cfg, humanModelName, mongoURI, humanGameMode) },
+	}
+	trainHumanCmd.Flags().StringVar(&humanModelName, "model", "human_trained.mdl", "output model filename")
+	trainHumanCmd.Flags().StringVar(&humanGameMode, "game-mode", "", "filter by game mode (partner, cutthroat, or empty for all)")
+
 	rootCmd.AddCommand(
 		&cobra.Command{
 			Use:   "train-reinforced",
@@ -3253,11 +3417,8 @@ func main() {
 			Short: "Train via Keras server",
 			Run:   func(cmd *cobra.Command, args []string) { trainKerasReinforced(cfg) },
 		},
-		&cobra.Command{
-			Use:   "train-human",
-			Short: "Train on human game data",
-			Run:   func(cmd *cobra.Command, args []string) { trainHuman(cfg) },
-		},
+		trainHumanCmd,
+		checkMongoCmd,
 		duppyCmd,
 	)
 
