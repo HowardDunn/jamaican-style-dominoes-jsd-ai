@@ -182,14 +182,40 @@ func GetOnlineTableList(token string) ([]*OnlineGameTable, error) {
 	return getTableList("online/list/", token)
 }
 
-func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string) DuppyGameRecord {
-	jsdAI := nn.New(126, []int{128, 64}, 56)
-	jsdAI.Search = false
-	err := jsdAI.Load(modelPath)
-	if err != nil {
-		log.Error("Error: ", err)
-		panic(err)
+// duppyAI is the interface both JSDNN (mlp) and SequenceTransformer satisfy
+// for online play.
+type duppyAI interface {
+	dominos.Player
+	UpdatePassMemory(gameEvent *dominos.GameEvent)
+	ResetPassMemory()
+	Load(fileName string) error
+}
+
+func loadModel(arch string, modelPath string) duppyAI {
+	switch arch {
+	case "transformer":
+		t := nn.NewSequenceTransformer(64, 2, 2, 128, 40, 56)
+		if err := t.Load(modelPath); err != nil {
+			log.Error("Error loading transformer: ", err)
+			panic(err)
+		}
+		return t
+	default:
+		m := nn.New(126, []int{128, 64}, 56)
+		m.Search = false
+		if err := m.Load(modelPath); err != nil {
+			log.Error("Error loading mlp: ", err)
+			panic(err)
+		}
+		return m
 	}
+}
+
+func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string, arch string) DuppyGameRecord {
+	jsdAI := loadModel(arch, modelPath)
+	// If it's a transformer, also observe events for sequence context
+	observer, hasObserver := jsdAI.(nn.EventObserver)
+
 	players := [4]dominos.Player{jsdAI, &dominos.ComputerPlayer{}, &dominos.ComputerPlayer{}, &dominos.ComputerPlayer{}}
 	gameURL := wsJSDUrl + "online/play/" + game.GameID
 	log.Info(gameURL)
@@ -223,11 +249,20 @@ func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string
 			}
 		} else if lastGameEvent.EventType == dominos.Passed {
 			jsdAI.UpdatePassMemory(lastGameEvent)
+			if hasObserver {
+				observer.ObserveEvent(lastGameEvent)
+			}
 		} else if lastGameEvent.EventType == dominos.RoundWin || lastGameEvent.EventType == dominos.RoundDraw {
 			jsdAI.ResetPassMemory()
+			if hasObserver {
+				observer.ResetHistory()
+			}
 		} else if lastGameEvent.EventType == dominos.GameWin || g.ConnectionCount > 100 {
 			g.Reset(0, mode)
 			jsdAI.ResetPassMemory()
+			if hasObserver {
+				observer.ResetHistory()
+			}
 			record := DuppyGameRecord{
 				GameID:    game.GameID,
 				Mode:      mode,
@@ -237,6 +272,9 @@ func PlayGame(game *OnlineGameTable, token string, modelPath string, mode string
 				Timestamp: time.Now(),
 			}
 			return record
+		} else if hasObserver {
+			// Feed all other events (PlayedCard, PosedCard from other players) to transformer
+			observer.ObserveEvent(lastGameEvent)
 		}
 
 		time.Sleep(300 * time.Millisecond)

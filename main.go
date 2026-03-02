@@ -1782,7 +1782,7 @@ func trainKerasReinforced(cfg trainConfig) {
 	log.Info("Took : ", time.Now().Sub(start))
 }
 
-func duppyPlay(cfg trainConfig, modelPath string, mode string, statsPath string) {
+func duppyPlay(cfg trainConfig, modelPath string, mode string, statsPath string, arch string) {
 	token, err := duppy.UserLogin("duppy", "@ecIN)A*$Y93UhZ*")
 	if err != nil {
 		panic(err)
@@ -1802,7 +1802,7 @@ func duppyPlay(cfg trainConfig, modelPath string, mode string, statsPath string)
 		for _, table := range onlineTables {
 			if table.PlayerInvolved && table.GameState == "running" && !playedGames[table.GameID] {
 				log.Info("Playing game: ", table.GameID)
-				record := duppy.PlayGame(table, token, modelPath, mode)
+				record := duppy.PlayGame(table, token, modelPath, mode, arch)
 				playedGames[table.GameID] = true
 
 				stats.Games = append(stats.Games, record)
@@ -3330,14 +3330,16 @@ func main() {
 	var duppyModel string
 	var duppyMode string
 	var duppyStatsPath string
+	var duppyArch string
 	duppyCmd := &cobra.Command{
 		Use:   "duppy-play",
 		Short: "Play games online as duppy",
-		Run:   func(cmd *cobra.Command, args []string) { duppyPlay(cfg, duppyModel, duppyMode, duppyStatsPath) },
+		Run:   func(cmd *cobra.Command, args []string) { duppyPlay(cfg, duppyModel, duppyMode, duppyStatsPath, duppyArch) },
 	}
 	duppyCmd.Flags().StringVar(&duppyModel, "model", "duppy.mdl", "path to model file")
 	duppyCmd.Flags().StringVar(&duppyMode, "mode", "cutthroat", "game mode (cutthroat or partner)")
 	duppyCmd.Flags().StringVar(&duppyStatsPath, "stats", "duppy_stats.json", "path to stats JSON file")
+	duppyCmd.Flags().StringVar(&duppyArch, "arch", "mlp", "model architecture (mlp or transformer)")
 
 	var mongoURI string
 	rootCmd.PersistentFlags().StringVar(&mongoURI, "mongo-uri", "", "MongoDB connection URI (default: production)")
