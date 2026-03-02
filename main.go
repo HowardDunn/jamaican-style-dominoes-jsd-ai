@@ -149,77 +149,77 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 	}
 	log.Infof("Loaded meta: %d iterations, %d games already trained on", meta.Iterations, len(seenGameIDs))
 
-	// Try to fetch games from MongoDB with retries, fall back to disk cache
+	// Try to fetch games from MongoDB with retries, fall back to disk cache.
+	// Partial downloads are kept across retries — each retry resumes via skip.
 	cachePath := cfg.resultsPath("game_cache.json")
-	var allGames []*gameCache
+	allGames := []*gameCache{}
 	const maxRetries = 3
+	fetchOK := false
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		log.Infof("Connecting to MongoDB (attempt %d/%d)...", attempt, maxRetries)
+		if attempt > 1 {
+			log.Infof("Retrying MongoDB (attempt %d/%d, have %d games so far)...", attempt, maxRetries, len(allGames))
+			time.Sleep(time.Duration(attempt*5) * time.Second)
+		} else {
+			log.Info("Connecting to MongoDB...")
+		}
+
 		client, err := mongodb.Connect(mongoURI)
 		if err != nil {
 			log.Warnf("Failed to connect to MongoDB: %v", err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt*5) * time.Second)
-				continue
-			}
-			break
+			continue
 		}
 
 		if err := client.Ping(); err != nil {
 			log.Warnf("MongoDB ping failed: %v", err)
 			client.Disconnect()
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt*5) * time.Second)
-				continue
-			}
-			break
+			continue
 		}
 		log.Info("MongoDB connected successfully")
 
-		gameCh, errCh := client.FetchGamesChan(gameMode)
-		fetched := []*gameCache{}
+		gameCh, errCh := client.FetchGamesChan(gameMode, int64(len(allGames)))
 		for doc := range gameCh {
 			if len(doc.GameEvents) == 0 {
 				continue
 			}
-			fetched = append(fetched, &gameCache{
+			allGames = append(allGames, &gameCache{
 				UUID:       doc.UUID,
 				GameEvents: doc.GameEvents,
 				GameType:   doc.GameType,
 				TimeCreate: doc.TimeCreate,
 			})
 		}
-		if fetchErr := <-errCh; fetchErr != nil {
-			log.Warnf("Error fetching games: %v", fetchErr)
-			client.Disconnect()
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt*5) * time.Second)
-				continue
-			}
-			break
-		}
 		client.Disconnect()
-		allGames = fetched
-		log.Infof("Fetched %d games from MongoDB", len(allGames))
 
-		// Save to disk cache for future runs
-		if err := saveGameCache(cachePath, allGames); err != nil {
-			log.Warnf("Failed to save game cache to disk: %v", err)
-		} else {
-			log.Infof("Saved game cache to %s", cachePath)
+		if fetchErr := <-errCh; fetchErr != nil {
+			log.Warnf("Error fetching games (got %d so far): %v", len(allGames), fetchErr)
+			continue
 		}
+
+		fetchOK = true
+		log.Infof("Fetched %d total games from MongoDB", len(allGames))
 		break
 	}
 
-	// Fall back to disk cache if MongoDB fetch failed
-	if allGames == nil {
-		log.Warn("All MongoDB attempts failed, loading from disk cache...")
+	// Save to disk cache if we got anything from MongoDB
+	if len(allGames) > 0 {
+		if err := saveGameCache(cachePath, allGames); err != nil {
+			log.Warnf("Failed to save game cache to disk: %v", err)
+		} else {
+			log.Infof("Saved %d games to disk cache: %s", len(allGames), cachePath)
+		}
+	}
+
+	// Fall back to disk cache if MongoDB fetch didn't complete
+	if !fetchOK && len(allGames) == 0 {
+		log.Warn("MongoDB fetch failed, loading from disk cache...")
 		allGames = loadGameCache(cachePath)
 		if allGames == nil {
 			log.Fatal("No disk cache available — cannot proceed without training data")
 		}
 		log.Infof("Loaded %d games from disk cache", len(allGames))
+	} else if !fetchOK {
+		log.Warnf("MongoDB fetch incomplete but got %d games — proceeding with partial data", len(allGames))
 	}
 
 	// Filter out already-seen games

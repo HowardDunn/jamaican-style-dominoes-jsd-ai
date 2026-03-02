@@ -107,7 +107,8 @@ func (c *Client) FetchGames(gameType string) ([]*GameDocument, error) {
 // FetchGamesChan starts downloading games in the background and streams them
 // through a channel. The caller can begin processing while the download continues.
 // The error channel receives at most one error (or is closed on success).
-func (c *Client) FetchGamesChan(gameType string) (<-chan *GameDocument, <-chan error) {
+// skip allows resuming a partial download by skipping the first N documents.
+func (c *Client) FetchGamesChan(gameType string, skip int64) (<-chan *GameDocument, <-chan error) {
 	ch := make(chan *GameDocument, 64)
 	errCh := make(chan error, 1)
 
@@ -124,15 +125,22 @@ func (c *Client) FetchGamesChan(gameType string) (<-chan *GameDocument, <-chan e
 			filter["gameType"] = gameType
 		}
 
-		log.Info("Downloading games from MongoDB in background...")
-		cursor, err := col.Find(ctx, filter)
+		opts := options.Find()
+		if skip > 0 {
+			opts.SetSkip(skip)
+			log.Infof("Resuming download from game %d...", skip)
+		} else {
+			log.Info("Downloading games from MongoDB in background...")
+		}
+
+		cursor, err := col.Find(ctx, filter, opts)
 		if err != nil {
 			errCh <- err
 			return
 		}
 		defer cursor.Close(ctx)
 
-		count := 0
+		count := int64(0)
 		for cursor.Next(ctx) {
 			var doc GameDocument
 			if err := cursor.Decode(&doc); err != nil {
@@ -142,14 +150,14 @@ func (c *Client) FetchGamesChan(gameType string) (<-chan *GameDocument, <-chan e
 			ch <- &doc
 			count++
 			if count%100 == 0 {
-				log.Infof("  ...fetched %d games so far", count)
+				log.Infof("  ...fetched %d games so far (total: %d)", count, skip+count)
 			}
 		}
 		if err := cursor.Err(); err != nil {
 			errCh <- err
 			return
 		}
-		log.Infof("Download complete: %d games fetched", count)
+		log.Infof("Download complete: %d new games fetched (total: %d)", count, skip+count)
 	}()
 
 	return ch, errCh
