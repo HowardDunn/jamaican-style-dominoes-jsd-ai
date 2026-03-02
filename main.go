@@ -48,10 +48,30 @@ func (c trainConfig) resultsPath(name string) string {
 }
 
 type gameCache struct {
-	UUID       string               `bson:"uuid", json:"uuid"`
-	GameEvents []*dominos.GameEvent `bson:"gameEvents", json:"gameEvents"`
-	GameType   string               `bson:"gameType", json:"gameType"`
-	TimeCreate time.Time            `bson:"timeCreated", json:"timeCreated"`
+	UUID       string               `bson:"uuid" json:"uuid"`
+	GameEvents []*dominos.GameEvent `bson:"gameEvents" json:"game_events"`
+	GameType   string               `bson:"gameType" json:"game_type"`
+	TimeCreate time.Time            `bson:"timeCreated" json:"time_created"`
+}
+
+func saveGameCache(path string, games []*gameCache) error {
+	data, err := json.Marshal(games)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func loadGameCache(path string) []*gameCache {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var games []*gameCache
+	if err := json.Unmarshal(data, &games); err != nil {
+		return nil
+	}
+	return games
 }
 
 func LoadData(path string) []*gameCache {
@@ -129,44 +149,90 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 	}
 	log.Infof("Loaded meta: %d iterations, %d games already trained on", meta.Iterations, len(seenGameIDs))
 
-	// Connect to MongoDB and start downloading games in background
-	log.Info("Connecting to MongoDB...")
-	client, err := mongodb.Connect(mongoURI)
-	if err != nil {
-		log.Fatal("Failed to connect to MongoDB: ", err)
+	// Try to fetch games from MongoDB with retries, fall back to disk cache
+	cachePath := cfg.resultsPath("game_cache.json")
+	var allGames []*gameCache
+	const maxRetries = 3
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Infof("Connecting to MongoDB (attempt %d/%d)...", attempt, maxRetries)
+		client, err := mongodb.Connect(mongoURI)
+		if err != nil {
+			log.Warnf("Failed to connect to MongoDB: %v", err)
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt*5) * time.Second)
+				continue
+			}
+			break
+		}
+
+		if err := client.Ping(); err != nil {
+			log.Warnf("MongoDB ping failed: %v", err)
+			client.Disconnect()
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt*5) * time.Second)
+				continue
+			}
+			break
+		}
+		log.Info("MongoDB connected successfully")
+
+		gameCh, errCh := client.FetchGamesChan(gameMode)
+		fetched := []*gameCache{}
+		for doc := range gameCh {
+			if len(doc.GameEvents) == 0 {
+				continue
+			}
+			fetched = append(fetched, &gameCache{
+				UUID:       doc.UUID,
+				GameEvents: doc.GameEvents,
+				GameType:   doc.GameType,
+				TimeCreate: doc.TimeCreate,
+			})
+		}
+		if fetchErr := <-errCh; fetchErr != nil {
+			log.Warnf("Error fetching games: %v", fetchErr)
+			client.Disconnect()
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt*5) * time.Second)
+				continue
+			}
+			break
+		}
+		client.Disconnect()
+		allGames = fetched
+		log.Infof("Fetched %d games from MongoDB", len(allGames))
+
+		// Save to disk cache for future runs
+		if err := saveGameCache(cachePath, allGames); err != nil {
+			log.Warnf("Failed to save game cache to disk: %v", err)
+		} else {
+			log.Infof("Saved game cache to %s", cachePath)
+		}
+		break
 	}
-	defer client.Disconnect()
 
-	if err := client.Ping(); err != nil {
-		log.Fatal("MongoDB ping failed: ", err)
+	// Fall back to disk cache if MongoDB fetch failed
+	if allGames == nil {
+		log.Warn("All MongoDB attempts failed, loading from disk cache...")
+		allGames = loadGameCache(cachePath)
+		if allGames == nil {
+			log.Fatal("No disk cache available — cannot proceed without training data")
+		}
+		log.Infof("Loaded %d games from disk cache", len(allGames))
 	}
-	log.Info("MongoDB connected successfully")
 
-	// Start download in background immediately
-	gameCh, errCh := client.FetchGamesChan(gameMode)
-
-	// Collect games as they stream in, filtering out already-seen ones
+	// Filter out already-seen games
 	skipped := 0
 	gameCaches := []*gameCache{}
-	for doc := range gameCh {
-		if len(doc.GameEvents) == 0 {
-			continue
-		}
-		if seenGameIDs[doc.UUID] {
+	for _, g := range allGames {
+		if seenGameIDs[g.UUID] {
 			skipped++
 			continue
 		}
-		gameCaches = append(gameCaches, &gameCache{
-			UUID:       doc.UUID,
-			GameEvents: doc.GameEvents,
-			GameType:   doc.GameType,
-			TimeCreate: doc.TimeCreate,
-		})
+		gameCaches = append(gameCaches, g)
 	}
-	if fetchErr := <-errCh; fetchErr != nil {
-		log.Fatal("Failed to fetch games: ", fetchErr)
-	}
-	log.Infof("Loaded %d new games from MongoDB (%d skipped as already trained)", len(gameCaches), skipped)
+	log.Infof("Loaded %d new games (%d skipped as already trained)", len(gameCaches), skipped)
 
 	randomSeed := time.Now().UnixNano()
 	log.Info("Using random Seed: ", randomSeed)
@@ -215,6 +281,10 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 						accuracies++
 					} else {
 						inaccuracies++
+					}
+					if cardChoice.Card >= 28 {
+						transformer.ObserveEvent(gameEvent)
+						continue
 					}
 					suit1, suit2 := dominos.GetCLIDominos()[cardChoice.Card].GetSuits()
 					if cardChoice.Side == dominos.Left {
