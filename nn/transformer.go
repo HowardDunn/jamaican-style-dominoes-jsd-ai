@@ -160,11 +160,11 @@ func newTransformerLayer(dModel, nHeads, dHead, dFF int) *transformerLayer {
 
 // forwardCache holds all intermediate results needed for backward pass.
 type forwardCache struct {
-	tokens    []moveToken
-	embedded  []float64 // [seqLen x dModel]
-	layerCaches []*transformerLayerCache
-	mask      []float64 // [seqLen x seqLen]
-	seqLen    int
+	tokens       []moveToken
+	embedded     []float64 // [seqLen x dModel]
+	layerCaches  []*transformerLayerCache
+	mask         []float64 // [seqLen x seqLen]
+	seqLen       int
 	lastTokenOut []float64 // [dModel] the last token's representation
 }
 
@@ -206,11 +206,11 @@ func (t *SequenceTransformer) forward(tokens []moveToken) ([]float64, *forwardCa
 	}
 
 	cache := &forwardCache{
-		tokens:      tokens,
-		embedded:    embedded,
-		layerCaches: layerCaches,
-		mask:        mask,
-		seqLen:      seqLen,
+		tokens:       tokens,
+		embedded:     embedded,
+		layerCaches:  layerCaches,
+		mask:         mask,
+		seqLen:       seqLen,
 		lastTokenOut: lastTokenOut,
 	}
 
@@ -628,4 +628,20 @@ func (t *SequenceTransformer) Load(fileName string) error {
 // ResetPassMemory resets pass memory (for compatibility with training loops).
 func (t *SequenceTransformer) ResetPassMemory() {
 	t.passMemory = [28]float64{}
+}
+
+// GetCardEmbeddings returns copies of the 28 card embedding vectors (each dModel-dim).
+func (t *SequenceTransformer) GetCardEmbeddings() [][]float64 {
+	embeddings := make([][]float64, 28)
+	for i := 0; i < 28; i++ {
+		vec := make([]float64, t.dModel)
+		copy(vec, t.cardEmbed.lookup(i))
+		embeddings[i] = vec
+	}
+	return embeddings
+}
+
+// GetDModel returns the model dimension.
+func (t *SequenceTransformer) GetDModel() int {
+	return t.dModel
 }

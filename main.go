@@ -7,9 +7,9 @@ import (
 	"math"
 	"math/rand"
 	"os"
-	"sort"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -577,8 +577,8 @@ func loadModelMeta(path string) modelMeta {
 }
 
 type humanTrainMeta struct {
-	Iterations    int      `json:"iterations"`
-	GamesTrainedOn int     `json:"games_trained_on"`
+	Iterations     int      `json:"iterations"`
+	GamesTrainedOn int      `json:"games_trained_on"`
 	TrainedGameIDs []string `json:"trained_game_ids"`
 }
 
@@ -3481,6 +3481,62 @@ func trainHeadToHead(cfg trainConfig) {
 	log.Info("Took : ", time.Now().Sub(start))
 }
 
+func checkModel(cfg trainConfig, modelPath string) {
+	transformer := nn.NewSequenceTransformer(64, 2, 2, 128, 40, 56)
+	if err := transformer.Load(modelPath); err != nil {
+		log.Fatalf("Failed to load model %s: %v", modelPath, err)
+	}
+	log.Infof("Loaded transformer model: %s (dModel=%d)", modelPath, transformer.GetDModel())
+
+	embeddings := transformer.GetCardEmbeddings()
+
+	// Build human-readable labels for 28 cards
+	labels := make([]string, 28)
+	for i := 0; i < 28; i++ {
+		ds := dominos.IndexSuitMap[i]
+		labels[i] = fmt.Sprintf("%d|%d (%d)", ds.Suit1, ds.Suit2, i)
+	}
+
+	// Create scatter plots for dimension pairs
+	dimPairs := [][2]int{{0, 1}, {2, 3}, {4, 5}, {6, 7}, {8, 9}, {10, 11}}
+	for _, pair := range dimPairs {
+		dimX, dimY := pair[0], pair[1]
+
+		pts := make(plotter.XYs, 28)
+		lbls := make([]string, 28)
+		for i := 0; i < 28; i++ {
+			pts[i].X = embeddings[i][dimX]
+			pts[i].Y = embeddings[i][dimY]
+			lbls[i] = labels[i]
+		}
+
+		scatter, err := plotter.NewScatter(pts)
+		if err != nil {
+			log.Fatalf("NewScatter: %v", err)
+		}
+
+		labelData := plotter.XYLabels{XYs: pts, Labels: lbls}
+		labelPlotter, err := plotter.NewLabels(labelData)
+		if err != nil {
+			log.Fatalf("NewLabels: %v", err)
+		}
+		labelPlotter.Offset.X = 5
+		labelPlotter.Offset.Y = 5
+
+		p := plot.New()
+		p.Title.Text = fmt.Sprintf("Card Embeddings: dim %d vs dim %d", dimX, dimY)
+		p.X.Label.Text = fmt.Sprintf("dim %d", dimX)
+		p.Y.Label.Text = fmt.Sprintf("dim %d", dimY)
+		p.Add(scatter, labelPlotter)
+
+		outPath := cfg.resultsPath(fmt.Sprintf("embed_dim%d_dim%d.png", dimX, dimY))
+		if err := p.Save(6*vg.Inch, 6*vg.Inch, outPath); err != nil {
+			log.Fatalf("Save plot: %v", err)
+		}
+		log.Infof("Saved %s", outPath)
+	}
+}
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "jsd-ai",
@@ -3501,7 +3557,9 @@ func main() {
 	duppyCmd := &cobra.Command{
 		Use:   "duppy-play",
 		Short: "Play games online as duppy",
-		Run:   func(cmd *cobra.Command, args []string) { duppyPlay(cfg, duppyModel, duppyMode, duppyStatsPath, duppyArch, duppySearch) },
+		Run: func(cmd *cobra.Command, args []string) {
+			duppyPlay(cfg, duppyModel, duppyMode, duppyStatsPath, duppyArch, duppySearch)
+		},
 	}
 	duppyCmd.Flags().StringVar(&duppyModel, "model", "duppy.mdl", "path to model file")
 	duppyCmd.Flags().StringVar(&duppyMode, "mode", "cutthroat", "game mode (cutthroat or partner)")
@@ -3548,11 +3606,21 @@ func main() {
 	trainHumanCmd := &cobra.Command{
 		Use:   "train-human",
 		Short: "Train on human game data from MongoDB",
-		Run:   func(cmd *cobra.Command, args []string) { trainHuman(cfg, humanModelName, mongoURI, humanGameMode, humanFilterUser) },
+		Run: func(cmd *cobra.Command, args []string) {
+			trainHuman(cfg, humanModelName, mongoURI, humanGameMode, humanFilterUser)
+		},
 	}
 	trainHumanCmd.Flags().StringVar(&humanModelName, "model", "human_trained.mdl", "output model filename")
 	trainHumanCmd.Flags().StringVar(&humanGameMode, "game-mode", "", "filter by game mode (partner, cutthroat, or empty for all)")
 	trainHumanCmd.Flags().StringVar(&humanFilterUser, "filter-user", "", "only train on games involving this username (empty = all players)")
+
+	var checkModelPath string
+	checkModelCmd := &cobra.Command{
+		Use:   "check-model",
+		Short: "Visualize transformer card embeddings as scatter plots",
+		Run:   func(cmd *cobra.Command, args []string) { checkModel(cfg, checkModelPath) },
+	}
+	checkModelCmd.Flags().StringVar(&checkModelPath, "model", "jasai_transformer1.mdl", "path to transformer model file")
 
 	rootCmd.AddCommand(
 		&cobra.Command{
@@ -3587,6 +3655,7 @@ func main() {
 		},
 		trainHumanCmd,
 		checkMongoCmd,
+		checkModelCmd,
 		duppyCmd,
 	)
 
