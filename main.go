@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sort"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -244,12 +245,35 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 	validationGames := gameCaches[trainingGamesIndex:]
 	correctGameEventTime := time.Date(2022, 12, 9, 0, 0, 0, 0, time.Local)
 
+	// restorePlayedCard ensures the played card is in PlayerHands[0] (the acting player's hand
+	// after rotation). MongoDB events have post-play hands where the played card was replaced
+	// with EmptyDomino, so we need to add it back for the model to see it.
+	restorePlayedCard := func(ge *dominos.GameEvent) {
+		card := ge.Card
+		hand := ge.PlayerHands[0]
+		// Check if card is already in hand
+		for _, h := range hand {
+			if h == card {
+				return
+			}
+		}
+		// Replace first EmptyDomino (29) slot, or append
+		for i, h := range hand {
+			if h >= 28 {
+				hand[i] = card
+				return
+			}
+		}
+		ge.PlayerHands[0] = append(hand, card)
+	}
+
 	// predictionEvaluation
 	evaluate := func() float64 {
 		accuracies := 0.0
 		inaccuracies := 0.0
 		compatibles := 0.0
 		incompatibles := 0.0
+		logCount := 0
 		bar := progressbar.Default(int64(len(validationGames)))
 		for _, gameCache := range validationGames {
 			bar.Add(1)
@@ -268,6 +292,7 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 			for _, gameEvent := range gameCache.GameEvents {
 				if gameEvent.EventType == dominos.PlayedCard {
 					rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
+					restorePlayedCard(rotatedGameEvent)
 					_, ok := filteredUsers[rotatedGameEvent.PlayerNames[0]]
 					if !ok && filterUsers {
 						transformer.ObserveEvent(gameEvent)
@@ -278,6 +303,48 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 					if err != nil {
 						log.Fatal("Error predicting: ", err)
 					}
+
+					// Log first 20 predictions with probabilities
+					if logCount < 20 {
+						probs := transformer.GetProbabilities(rotatedGameEvent)
+						type probEntry struct {
+							index int
+							prob  float64
+						}
+						sorted := make([]probEntry, len(probs))
+						for i, p := range probs {
+							sorted[i] = probEntry{i, p}
+						}
+						sort.Slice(sorted, func(i, j int) bool { return sorted[i].prob > sorted[j].prob })
+
+						actualSide := "L"
+						if gameEvent.Side == dominos.Right {
+							actualSide = "R"
+						}
+						predSide := "L"
+						if cardChoice.Side == dominos.Right {
+							predSide = "R"
+						}
+						hand := rotatedGameEvent.PlayerHands[rotatedGameEvent.Player]
+						log.Infof("EVAL[%d] Pred: card=%d side=%s | Actual: card=%d side=%s | Hand: %v",
+							logCount, cardChoice.Card, predSide, gameEvent.Card, actualSide, hand)
+						topN := 5
+						if len(sorted) < topN {
+							topN = len(sorted)
+						}
+						for k := 0; k < topN; k++ {
+							idx := sorted[k].index
+							card := idx
+							side := "L"
+							if idx >= 28 {
+								card -= 28
+								side = "R"
+							}
+							log.Infof("  Top%d: idx=%d (card=%d side=%s) prob=%.6f", k+1, idx, card, side, sorted[k].prob)
+						}
+						logCount++
+					}
+
 					if cardChoice.Card == gameEvent.Card && cardChoice.Side == gameEvent.Side {
 						accuracies++
 					} else {
@@ -339,6 +406,7 @@ func trainHuman(cfg trainConfig, modelName string, mongoURI string, gameMode str
 			for _, gameEvent := range gameCache.GameEvents {
 				if gameEvent.EventType == dominos.PosedCard || gameEvent.EventType == dominos.PlayedCard {
 					rotatedGameEvent := jsdonline.CopyandRotateGameEvent(gameEvent, gameEvent.Player)
+					restorePlayedCard(rotatedGameEvent)
 					_, ok := filteredUsers[rotatedGameEvent.PlayerNames[0]]
 					if !ok && filterUsers {
 						transformer.ObserveEvent(gameEvent)

@@ -187,6 +187,35 @@ func clipGrad(x float64) float64 {
 	return x
 }
 
+// hasPlayerWin checks if nextEvents contain a RoundWin where player 0 won.
+// Events are already rotated to current player's perspective (player 0 = self).
+// Used to boost learning rate 10x on plays that lead to a win.
+func hasPlayerWin(nextEvents [16]*dominos.GameEvent) bool {
+	for _, evt := range nextEvents {
+		if evt == nil {
+			break
+		}
+		if evt.EventType == dominos.RoundWin && evt.Player == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasTeamWin checks if nextEvents contain a RoundWin where player 0 or partner (player 2) won.
+// Events are already rotated to current player's perspective.
+func hasTeamWin(nextEvents [16]*dominos.GameEvent) bool {
+	for _, evt := range nextEvents {
+		if evt == nil {
+			break
+		}
+		if evt.EventType == dominos.RoundWin && (evt.Player == 0 || evt.Player == 2) {
+			return true
+		}
+	}
+	return false
+}
+
 func sum(x []float64) float64 {
 	s := 0.0
 	for i := range x {
@@ -1372,6 +1401,15 @@ func (j *JSDNN) TrainReinforced(gameEvent *dominos.GameEvent, learnRates []float
 	}
 	y := j.ConvertCardChoiceToTensorReinforced(gameEvent, nextGameEvents)
 
+	// Boost learning rate 10x on plays that lead to a win/loss outcome
+	if hasPlayerWin(nextGameEvents) {
+		boosted := make([]float64, len(learnRates))
+		for i, lr := range learnRates {
+			boosted[i] = lr * 10.0
+		}
+		learnRates = boosted
+	}
+
 	// Build a mask: 1.0 only at the index of the action taken, 0.0 elsewhere
 	actionMask := [56]float64{}
 	actionIndex := gameEvent.Card
@@ -1394,6 +1432,15 @@ func (j *JSDNN) TrainReinforcedPartner(gameEvent *dominos.GameEvent, learnRates 
 		return 0.0, nil
 	}
 	y := j.ConvertCardChoiceToTensorReinforcedPartner(gameEvent, nextGameEvents)
+
+	// Boost learning rate 10x on plays that lead to a team win
+	if hasTeamWin(nextGameEvents) {
+		boosted := make([]float64, len(learnRates))
+		for i, lr := range learnRates {
+			boosted[i] = lr * 10.0
+		}
+		learnRates = boosted
+	}
 
 	// Build a mask: 1.0 only at the index of the action taken, 0.0 elsewhere
 	actionMask := [56]float64{}

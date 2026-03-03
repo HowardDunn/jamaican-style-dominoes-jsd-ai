@@ -110,10 +110,10 @@ func (t *SequenceTransformer) embedBackward(dEmbed []float64, tokens []moveToken
 
 		for j := 0; j < dModel; j++ {
 			grad := clipGrad(dEmbed[base+j])
-			t.playerEmbed.data[pBase+j] = t.playerEmbed.data[pBase+j]*weightDecay + lr*grad
-			t.cardEmbed.data[cBase+j] = t.cardEmbed.data[cBase+j]*weightDecay + lr*grad
-			t.sideEmbed.data[sBase+j] = t.sideEmbed.data[sBase+j]*weightDecay + lr*grad
-			t.modeEmbed.data[mBase+j] = t.modeEmbed.data[mBase+j]*weightDecay + lr*grad
+			t.playerEmbed.data[pBase+j] = t.playerEmbed.data[pBase+j]*t.WeightDecay + lr*grad
+			t.cardEmbed.data[cBase+j] = t.cardEmbed.data[cBase+j]*t.WeightDecay + lr*grad
+			t.sideEmbed.data[sBase+j] = t.sideEmbed.data[sBase+j]*t.WeightDecay + lr*grad
+			t.modeEmbed.data[mBase+j] = t.modeEmbed.data[mBase+j]*t.WeightDecay + lr*grad
 		}
 	}
 }

@@ -49,7 +49,8 @@ type SequenceTransformer struct {
 
 	// Training config
 	Epsilon          float64
-	OutputActivation string // "linear" (default)
+	OutputActivation string  // "linear" (default)
+	WeightDecay      float64 // per-step multiplicative decay (default 1.0 = no decay)
 	TotalWins        int
 	TotalWins2       int
 
@@ -85,6 +86,7 @@ func NewSequenceTransformer(dModel, nHeads, nLayers, dFF, maxSeqLen, outputDim i
 		ComputerPlayer:   &dominos.ComputerPlayer{},
 		gameMode:         "partner",
 		OutputActivation: "linear",
+		WeightDecay:      1.0,
 	}
 
 	// Initialize transformer layers

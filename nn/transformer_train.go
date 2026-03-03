@@ -33,7 +33,7 @@ func (t *SequenceTransformer) backward(outputGrad []float64, cache *forwardCache
 		t.bOut[i] += lr * grad
 		for j := 0; j < dModel; j++ {
 			dwOut := clipGrad(outputGrad[i] * cache.lastTokenOut[j])
-			t.wOut[i*dModel+j] = t.wOut[i*dModel+j]*weightDecay + lr*dwOut
+			t.wOut[i*dModel+j] = t.wOut[i*dModel+j]*t.WeightDecay + lr*dwOut
 		}
 	}
 
@@ -47,7 +47,7 @@ func (t *SequenceTransformer) backward(outputGrad []float64, cache *forwardCache
 	for l := t.nLayers - 1; l >= 0; l-- {
 		var grads *transformerLayerGrads
 		dx, grads = transformerLayerBackward(dx, cache.layerCaches[l], t.layers[l], cache.mask, seqLen)
-		applyLayerGradients(t.layers[l], grads, lr)
+		applyLayerGradients(t.layers[l], grads, lr, t.WeightDecay)
 	}
 
 	// Backward through embeddings
@@ -55,11 +55,11 @@ func (t *SequenceTransformer) backward(outputGrad []float64, cache *forwardCache
 }
 
 // applyLayerGradients updates a transformer layer's weights using computed gradients.
-func applyLayerGradients(layer *transformerLayer, grads *transformerLayerGrads, lr float64) {
+func applyLayerGradients(layer *transformerLayer, grads *transformerLayerGrads, lr float64, wd float64) {
 	updateWeightSlice := func(w []float64, dw []float64) {
 		for i := range w {
 			grad := clipGrad(dw[i])
-			w[i] = w[i]*weightDecay + lr*grad
+			w[i] = w[i]*wd + lr*grad
 		}
 	}
 
@@ -106,6 +106,11 @@ func (t *SequenceTransformer) TrainReinforced(gameEvent *dominos.GameEvent, lear
 	// Build target using existing reward computation
 	target := t.computeRewardCutthroat(gameEvent, nextEvents)
 
+	// Boost learning rate 10x on plays that lead to a win
+	if hasPlayerWin(nextEvents) {
+		learnRate *= 10.0
+	}
+
 	return t.trainOnEvent(gameEvent, target, learnRate)
 }
 
@@ -116,6 +121,11 @@ func (t *SequenceTransformer) TrainReinforcedPartner(gameEvent *dominos.GameEven
 	}
 
 	target := t.computeRewardPartner(gameEvent, nextEvents)
+
+	// Boost learning rate 10x on plays that lead to a team win
+	if hasTeamWin(nextEvents) {
+		learnRate *= 10.0
+	}
 
 	return t.trainOnEvent(gameEvent, target, learnRate)
 }
@@ -514,6 +524,16 @@ func (t *SequenceTransformer) Predict(gameEvent *dominos.GameEvent) (*dominos.Ca
 	}
 
 	return &dominos.CardChoice{Card: bestCard, Side: bestSide}, nil
+}
+
+// GetProbabilities returns the softmax probabilities for a game event (for debugging).
+func (t *SequenceTransformer) GetProbabilities(gameEvent *dominos.GameEvent) []float64 {
+	tokens := t.buildSequenceFromGameEvent(gameEvent)
+	if len(tokens) == 0 {
+		return make([]float64, t.outputDim)
+	}
+	logits, _ := t.forward(tokens)
+	return softmax(logits)
 }
 
 // ConvertGameEventToHistoryTokens converts round events up to a given index into history tokens.
